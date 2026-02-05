@@ -43,8 +43,5 @@ The built `.app` ends up under:
 make ipa
 ```
 
-The resulting `.ipa` is written under Theos’ package directory (usually `.theos/packages/`).
+The resulting `.ipa` is written under Theos’ package directory (usually `./packages/`).
 
-## Notes
-
-- The RVVM submodule path is `RVVM` by default; override with `RVVM_DIR=...` if needed.
