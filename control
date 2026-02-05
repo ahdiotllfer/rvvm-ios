@@ -1,0 +1,8 @@
+Package: com.adih.rvvm
+Name: rvvm
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: RVVM emulator application
+Maintainer: adolf
+Author: adolf
+Section: Utilities

@@ -1,0 +1,15 @@
+.theos/
+packages/
+
+build/
+DerivedData/
+*.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+*.xcuserstate
+*.moved-aside
+*.swp
+*.swo
+
+.DS_Store
+Thumbs.db
