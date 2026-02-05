@@ -318,7 +318,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 {
 	(void)tableView;
 	switch (section) {
-		case 0: return 8;
+		case 0: return 9;
 		case 1: return 2;
 		case 2: return self.docFiles.count;
 	}
@@ -395,12 +395,19 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 		} else if (indexPath.row == 6) {
-			cell.textLabel.text = @"Save snapshot";
+			cell.textLabel.text = @"Reinit network";
+			cell.textLabel.textColor = UIColor.systemOrangeColor;
 			cell.detailTextLabel.text = @"";
 			cell.accessoryType = UITableViewCellAccessoryNone;
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 		} else if (indexPath.row == 7) {
+			cell.textLabel.text = @"Save snapshot";
+			cell.detailTextLabel.text = @"";
+			cell.accessoryType = UITableViewCellAccessoryNone;
+			cell.accessoryView = nil;
+			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+		} else if (indexPath.row == 8) {
 			BOOL exists = [self snapshotExists];
 			cell.textLabel.text = @"Load snapshot";
 			cell.detailTextLabel.text = exists ? @"Available" : @"Missing";
@@ -648,6 +655,10 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return;
 	}
 	if (indexPath.section == 0 && indexPath.row == 6) {
+		[RV64Runner reinitNetwork];
+		return;
+	}
+	if (indexPath.section == 0 && indexPath.row == 7) {
 		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Save snapshot"
 		                                                            message:@"This saves the current VM state (RAM + CPU registers) to Documents/rvvm.snapshot.img"
 		                                                     preferredStyle:UIAlertControllerStyleAlert];
@@ -678,7 +689,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		[self presentViewController:ac animated:YES completion:nil];
 		return;
 	}
-	if (indexPath.section == 0 && indexPath.row == 7) {
+	if (indexPath.section == 0 && indexPath.row == 8) {
 		if (![self snapshotExists]) {
 			return;
 		}

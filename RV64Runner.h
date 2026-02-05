@@ -18,6 +18,7 @@ extern NSString * const RV64RunnerUARTTextKey;
 @interface RV64Runner : NSObject
 + (void)startLinux;
 + (void)requestRestart;
++ (void)reinitNetwork;
 + (BOOL)saveSnapshot:(NSString * _Nullable * _Nullable)errorOut;
 + (BOOL)loadSnapshot:(NSString * _Nullable * _Nullable)errorOut;
 + (void)sendConsoleBytes:(NSData * _Nullable)data;

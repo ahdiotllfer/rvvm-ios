@@ -15,6 +15,7 @@ extern "C" {
 #include "devices/riscv-aclint.h"
 #include "devices/riscv-plic.h"
 #include "devices/rtl8169.h"
+#include "devices/tap_api.h"
 #include "devices/rtc-goldfish.h"
 #include "devices/syscon.h"
 }
@@ -94,6 +95,7 @@ static dispatch_source_t s_uart_flush_timer;
 static dispatch_once_t s_uart_flush_once;
 static rvvm_machine_t* s_machine = nullptr;
 static chardev_t* s_chardev = nullptr;
+static tap_dev_t* s_tap = nullptr;
 static dispatch_semaphore_t s_restart_sema;
 static dispatch_once_t s_restart_once;
 static std::atomic<bool> s_restart_requested(false);
@@ -804,6 +806,7 @@ static bool RunLinuxOnce()
 			std::lock_guard<std::mutex> lock(s_state_mutex);
 			s_machine = machine;
 			s_chardev = chardev;
+			s_tap = tap;
 			s_active_writable_disk_path = useIso ? installDiskPath : (useArchImage ? imagePath : std::string());
 		}
 		rvvm_start_machine(machine);
@@ -854,6 +857,7 @@ static bool RunLinuxOnce()
 			std::lock_guard<std::mutex> lock(s_state_mutex);
 			s_chardev = nullptr;
 			s_machine = nullptr;
+			s_tap = nullptr;
 			s_active_writable_disk_path.clear();
 		}
 		if (tap) {
@@ -901,6 +905,14 @@ static bool RunLinuxOnce()
 	}
 	if (machine) {
 		rvvm_pause_machine(machine);
+	}
+}
+
++ (void)reinitNetwork
+{
+	std::lock_guard<std::mutex> lock(s_state_mutex);
+	if (s_tap) {
+		tap_reinit(s_tap);
 	}
 }
 
