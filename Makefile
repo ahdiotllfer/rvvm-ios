@@ -21,6 +21,7 @@ rvvm_FILES = \
 	$(RVVM_DIR)/src/devices/ns16550a.c \
 	$(RVVM_DIR)/src/devices/syscon.c \
 	$(RVVM_DIR)/src/devices/rtc-goldfish.c \
+	$(RVVM_DIR)/src/devices/virtio-fs.c \
 	$(RVVM_DIR)/src/devices/tap_user.c \
 	$(RVVM_DIR)/src/devices/rtl8169.c \
 	$(RVVM_DIR)/src/devices/nvme.c \

@@ -17,6 +17,7 @@ extern "C" {
 #include "devices/rtl8169.h"
 #include "devices/rtc-goldfish.h"
 #include "devices/syscon.h"
+#include "devices/virtio-fs.h"
 }
 
 #include <algorithm>
@@ -34,6 +35,7 @@ extern "C" {
 
 NSString *const RV64RunnerUARTTextNotification = @"RV64RunnerUARTTextNotification";
 NSString *const RV64RunnerUARTTextKey = @"text";
+NSString *const RV64RunnerVirtioFSDebugNotification = @"RV64RunnerVirtioFSDebugNotification";
 
 static NSString *const kRVVMDefaultsBootMode = @"rvvm.bootMode";
 static NSString *const kRVVMDefaultsCores = @"rvvm.cores";
@@ -43,6 +45,7 @@ static NSString *const kRVVMDefaultsIsoFilename = @"rvvm.isoFilename";
 static NSString *const kRVVMDefaultsDiskFilename = @"rvvm.diskFilename";
 static NSString *const kRVVMDefaultsArchImgFilename = @"rvvm.archImgFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
+static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -62,6 +65,60 @@ static void PostUARTText(const std::string& s)
 	dispatch_async(dispatch_get_main_queue(), ^{
 		[[NSNotificationCenter defaultCenter] postNotificationName:RV64RunnerUARTTextNotification object:text userInfo:nil];
 	});
+}
+
+static void PostVirtioFSDebugText(const std::string& s)
+{
+	CFStringRef cfText = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8 *)s.data(), (CFIndex)s.size(),
+	                                            kCFStringEncodingUTF8, false);
+	NSString *text = cfText ? (__bridge_transfer NSString *)cfText : nil;
+	if (!text || text.length == 0) {
+		return;
+	}
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[[NSNotificationCenter defaultCenter] postNotificationName:RV64RunnerVirtioFSDebugNotification object:text userInfo:nil];
+	});
+}
+
+static std::mutex s_vfs_debug_mu;
+static std::deque<std::string> s_vfs_debug_lines;
+static size_t s_vfs_debug_bytes = 0;
+static std::atomic<bool> s_vfs_debug_to_uart(true);
+
+static void AppendVirtioFSDebugLine(const std::string& s)
+{
+	constexpr size_t kMaxLines = 1000;
+	constexpr size_t kMaxBytes = 256 * 1024;
+	std::lock_guard<std::mutex> lock(s_vfs_debug_mu);
+	s_vfs_debug_lines.push_back(s);
+	s_vfs_debug_bytes += s.size();
+	while (!s_vfs_debug_lines.empty() && (s_vfs_debug_lines.size() > kMaxLines || s_vfs_debug_bytes > kMaxBytes)) {
+		s_vfs_debug_bytes -= s_vfs_debug_lines.front().size();
+		s_vfs_debug_lines.pop_front();
+	}
+}
+
+extern "C" void rvvm_ios_uart_debug_print(const char* s) __attribute__((used));
+extern "C" void rvvm_ios_uart_debug_print(const char* s)
+{
+	if (!s) {
+		return;
+	}
+	PostUARTText(std::string(s));
+}
+
+extern "C" void rvvm_ios_virtiofs_debug_print(const char* s) __attribute__((used));
+extern "C" void rvvm_ios_virtiofs_debug_print(const char* s)
+{
+	if (!s) {
+		return;
+	}
+	std::string str(s);
+	AppendVirtioFSDebugLine(str);
+	PostVirtioFSDebugText(str);
+	if (s_vfs_debug_to_uart.load()) {
+		PostUARTText(str);
+	}
 }
 
 static std::string FileSystemPath(NSURL *url)
@@ -104,6 +161,12 @@ static std::mutex s_snapshot_result_mu;
 static bool s_snapshot_result_ok = false;
 static std::string s_snapshot_result_msg;
 static std::string s_active_writable_disk_path;
+static dispatch_semaphore_t s_network_done_sema;
+static dispatch_once_t s_network_once;
+static std::atomic<int> s_network_op(0);
+static std::mutex s_network_result_mu;
+static bool s_network_result_ok = false;
+static std::string s_network_result_msg;
 
 static void EnsureSnapshotPrimitives()
 {
@@ -127,6 +190,23 @@ static void EnsureRestartSemaphore()
 	dispatch_once(&s_restart_once, ^{
 		s_restart_sema = dispatch_semaphore_create(0);
 	});
+}
+
+static void EnsureNetworkPrimitives()
+{
+	dispatch_once(&s_network_once, ^{
+		s_network_done_sema = dispatch_semaphore_create(0);
+	});
+}
+
+static void SetNetworkResult(bool ok, const std::string& msg)
+{
+	{
+		std::lock_guard<std::mutex> lock(s_network_result_mu);
+		s_network_result_ok = ok;
+		s_network_result_msg = msg;
+	}
+	dispatch_semaphore_signal(s_network_done_sema);
 }
 
 struct UIKitChardevState
@@ -416,6 +496,9 @@ static bool RunLinuxOnce()
 		NSString *diskFilename = [defaults stringForKey:kRVVMDefaultsDiskFilename];
 		NSString *archImgFilename = [defaults stringForKey:kRVVMDefaultsArchImgFilename];
 		NSArray *portForwards = (NSArray *)[defaults objectForKey:kRVVMDefaultsPortForwards];
+		id vfsDbgObj = [defaults objectForKey:kRVVMDefaultsVirtioFSDebugToUART];
+		BOOL virtioFSDebugToUart = vfsDbgObj ? [defaults boolForKey:kRVVMDefaultsVirtioFSDebugToUART] : YES;
+		s_vfs_debug_to_uart.store(virtioFSDebugToUart);
 
 		NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
 		NSString *docsDirPath = (docsDirs.count > 0) ? [docsDirs objectAtIndex:0] : nil;
@@ -455,6 +538,13 @@ static bool RunLinuxOnce()
 		NSURL *alpineIsoURL = [bundle URLForResource:@"alpine-standard-3.23.3-riscv64" withExtension:@"iso" subdirectory:@"rv64linux"];
 		NSURL *alpineDiskSeedURL = [bundle URLForResource:@"alpine-riscv64" withExtension:@"img" subdirectory:@"rv64linux"];
 		NSURL *archImgURL = [bundle URLForResource:@"archriscv-2026-01-07-4g" withExtension:@"img" subdirectory:@"rv64linux"];
+
+		std::string snapPath = SnapshotFilePathUTF8();
+		RvvmSnapshotHeader snapHdr = {};
+		bool haveSnap = (!snapPath.empty() && ReadRvvmSnapshotHeader(snapPath, &snapHdr));
+		if (!haveSnap && !snapPath.empty() && PathExists(snapPath)) {
+			PostUARTText("rvvm: snapshot present but incompatible, ignoring\n");
+		}
 
 		std::string isoPath;
 		if (!disableIso) {
@@ -524,6 +614,10 @@ static bool RunLinuxOnce()
 					return false;
 				}
 			} else {
+				if (haveSnap) {
+					PostUARTText("rvvm: snapshot load requires existing disk image\n");
+					return false;
+				}
 				if (docsDirPath.length == 0 || docsPathUTF8.empty()) {
 					PostUARTText("rvvm: missing documents dir\n");
 					return false;
@@ -575,7 +669,7 @@ static bool RunLinuxOnce()
 				PostUARTText("rvvm: install disk path failed\n");
 				return false;
 			}
-			if (diskFilename.length == 0 && ![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
+			if (!haveSnap && diskFilename.length == 0 && ![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
 				std::string seedPath = FileSystemPath(alpineDiskSeedURL);
 				if (!seedPath.empty()) {
 					CFStringRef cfSeedPath = CFStringCreateWithCString(kCFAllocatorDefault, seedPath.c_str(), kCFStringEncodingUTF8);
@@ -590,35 +684,35 @@ static bool RunLinuxOnce()
 				}
 			}
 
-			size_t diskSize = 0;
-			static const size_t sizes[] = {
-				(size_t)(1ULL << 30),
-			};
+			if (!haveSnap) {
+				size_t diskSize = 0;
+				static const size_t sizes[] = {
+					(size_t)(1ULL << 30),
+				};
 
-			bool ok = false;
-			for (size_t s : sizes) {
-				if (EnsureSparseRawImage(installDiskPath, s, &diskSize)) {
-					ok = true;
-					break;
+				bool ok = false;
+				for (size_t s : sizes) {
+					if (EnsureSparseRawImage(installDiskPath, s, &diskSize)) {
+						ok = true;
+						break;
+					}
+				}
+				if (!ok) {
+					PostUARTText("rvvm: install disk create failed\n");
+					return false;
+				}
+				char buf[128];
+				snprintf(buf, sizeof(buf), "rvvm: install disk %zu MiB\n", (size_t)(diskSize >> 20));
+				PostUARTText(std::string(buf));
+			} else {
+				if (![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
+					PostUARTText("rvvm: snapshot load requires existing install disk\n");
+					return false;
 				}
 			}
-			if (!ok) {
-				PostUARTText("rvvm: install disk create failed\n");
-				return false;
-			}
-			char buf[128];
-			snprintf(buf, sizeof(buf), "rvvm: install disk %zu MiB\n", (size_t)(diskSize >> 20));
-			PostUARTText(std::string(buf));
 		}
 
 		PostUARTText("rvvm: starting...\n");
-
-		std::string snapPath = SnapshotFilePathUTF8();
-		RvvmSnapshotHeader snapHdr = {};
-		bool haveSnap = (!snapPath.empty() && ReadRvvmSnapshotHeader(snapPath, &snapHdr));
-		if (!haveSnap && !snapPath.empty() && PathExists(snapPath)) {
-			PostUARTText("rvvm: snapshot present but incompatible, ignoring\n");
-		}
 
 		size_t preferredMem = 0;
 		if (haveSnap) {
@@ -765,6 +859,13 @@ static bool RunLinuxOnce()
 		syscon_init_auto(machine);
 		rtc_goldfish_init_auto(machine);
 		ns16550a_init_auto(machine, chardev);
+		if (!docsPathUTF8.empty()) {
+			if (virtio_fs_init_auto(machine, "share", docsPathUTF8.c_str())) {
+				PostUARTText("rvvm: virtio-fs ok\n");
+			} else {
+				PostUARTText("rvvm: virtio-fs failed\n");
+			}
+		}
 
 		if (!rvvm_load_firmware(machine, biosPath.c_str())) {
 			PostUARTText("rvvm: load firmware failed\n");
@@ -847,6 +948,22 @@ static bool RunLinuxOnce()
 				rvvm_start_machine(machine);
 				continue;
 			}
+			int netOp = s_network_op.exchange(0);
+			if (netOp == 1) {
+				if (!tap) {
+					SetNetworkResult(false, "network: tap unavailable");
+					rvvm_start_machine(machine);
+					continue;
+				}
+				if (!tap_reinit(tap)) {
+					SetNetworkResult(false, "network reinit failed");
+					rvvm_start_machine(machine);
+					continue;
+				}
+				SetNetworkResult(true, "network reinitialized");
+				rvvm_start_machine(machine);
+				continue;
+			}
 			break;
 		}
 
@@ -873,6 +990,7 @@ static bool RunLinuxOnce()
 	dispatch_once(&onceToken, ^{
 		EnsureRestartSemaphore();
 		EnsureSnapshotPrimitives();
+		EnsureNetworkPrimitives();
 		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
 			for (;;) {
 				(void)RunLinuxOnce();
@@ -885,6 +1003,31 @@ static bool RunLinuxOnce()
 			}
 		});
 	});
+}
+
++ (void)setVirtioFSDebugToUARTEnabled:(BOOL)enabled
+{
+	s_vfs_debug_to_uart.store(enabled);
+}
+
++ (NSArray<NSString *> *)virtioFSDebugLines
+{
+	std::lock_guard<std::mutex> lock(s_vfs_debug_mu);
+	NSMutableArray<NSString *> *out = [[NSMutableArray alloc] initWithCapacity:(NSUInteger)s_vfs_debug_lines.size()];
+	for (const std::string& line : s_vfs_debug_lines) {
+		NSString *s = NSStringFromUTF8String(line);
+		if (s.length > 0) {
+			[out addObject:s];
+		}
+	}
+	return out;
+}
+
++ (void)clearVirtioFSDebug
+{
+	std::lock_guard<std::mutex> lock(s_vfs_debug_mu);
+	s_vfs_debug_lines.clear();
+	s_vfs_debug_bytes = 0;
 }
 
 + (void)requestRestart
@@ -1016,6 +1159,71 @@ static bool RunLinuxOnce()
 		if (errorOut) {
 			NSString *m = NSStringFromUTF8String(msg);
 			*errorOut = (m.length > 0) ? m : @"Snapshot load failed";
+		}
+		return NO;
+	}
+	return YES;
+}
+
++ (BOOL)reinitNetwork:(NSString * _Nullable * _Nullable)errorOut
+{
+	EnsureNetworkPrimitives();
+	rvvm_machine_t* machine = nullptr;
+	bool running = false;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		machine = s_machine;
+		running = machine ? rvvm_machine_running(machine) : false;
+	}
+	if (!machine || !running) {
+		if (errorOut) {
+			*errorOut = @"VM is not running";
+		}
+		return NO;
+	}
+	if (s_snapshot_op.load() != 0) {
+		if (errorOut) {
+			*errorOut = @"Another VM operation is in progress";
+		}
+		return NO;
+	}
+	int expected = 0;
+	if (!s_network_op.compare_exchange_strong(expected, 1)) {
+		if (errorOut) {
+			*errorOut = @"Network operation already in progress";
+		}
+		return NO;
+	}
+	while (dispatch_semaphore_wait(s_network_done_sema, DISPATCH_TIME_NOW) == 0) {
+	}
+	if (!rvvm_pause_machine(machine)) {
+		s_network_op.store(0);
+		if (errorOut) {
+			*errorOut = @"Failed to pause VM";
+		}
+		return NO;
+	}
+	int64_t timeoutNsec = (int64_t)(60 * NSEC_PER_SEC);
+	long waitRes = dispatch_semaphore_wait(s_network_done_sema, dispatch_time(DISPATCH_TIME_NOW, timeoutNsec));
+	if (waitRes != 0) {
+		s_network_op.store(0);
+		rvvm_start_machine(machine);
+		if (errorOut) {
+			*errorOut = @"Network reinit timed out";
+		}
+		return NO;
+	}
+	bool ok = false;
+	std::string msg;
+	{
+		std::lock_guard<std::mutex> lock(s_network_result_mu);
+		ok = s_network_result_ok;
+		msg = s_network_result_msg;
+	}
+	if (!ok) {
+		if (errorOut) {
+			NSString *m = NSStringFromUTF8String(msg);
+			*errorOut = (m.length > 0) ? m : @"Network reinit failed";
 		}
 		return NO;
 	}

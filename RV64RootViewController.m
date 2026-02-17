@@ -12,6 +12,7 @@ static NSString *const kRVVMDefaultsDisableIso = @"rvvm.disableIso";
 static NSString *const kRVVMDefaultsIsoFilename = @"rvvm.isoFilename";
 static NSString *const kRVVMDefaultsDiskFilename = @"rvvm.diskFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
+static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -21,6 +22,9 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 };
 
 @interface RV64SettingsViewController : UITableViewController
+@end
+
+@interface RV64VirtioFSDebugViewController : UIViewController
 @end
 
 @interface RV64TerminalWebView : WKWebView
@@ -52,6 +56,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 @property (nonatomic) NSInteger cores;
 @property (nonatomic) NSInteger ramMB;
 @property (nonatomic) BOOL disableIso;
+@property (nonatomic) BOOL virtioFSDebugToUart;
 @property (nonatomic, copy) NSString *isoFilename;
 @property (nonatomic, copy) NSString *diskFilename;
 @property (nonatomic, copy) NSArray<NSString *> *portForwards;
@@ -166,6 +171,109 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 
 @end
 
+@interface RV64VirtioFSDebugViewController ()
+@property (nonatomic, strong) UITextView *textView;
+@end
+
+@implementation RV64VirtioFSDebugViewController
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.title = @"Virtio-FS Debug";
+	self.view.backgroundColor = UIColor.systemBackgroundColor;
+
+	UITextView *tv = [UITextView new];
+	tv.editable = NO;
+	tv.selectable = YES;
+	tv.alwaysBounceVertical = YES;
+	tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+	tv.textColor = UIColor.labelColor;
+	tv.backgroundColor = UIColor.systemBackgroundColor;
+	tv.translatesAutoresizingMaskIntoConstraints = NO;
+	[self.view addSubview:tv];
+	self.textView = tv;
+
+	[NSLayoutConstraint activateConstraints:@[
+		[tv.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:12],
+		[tv.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-12],
+		[tv.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
+		[tv.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
+	]];
+
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Clear" style:UIBarButtonItemStylePlain target:self action:@selector(clearPressed:)];
+	[self reloadAll];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+	[super viewWillAppear:animated];
+	[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onDebugLine:) name:RV64RunnerVirtioFSDebugNotification object:nil];
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+	[super viewWillDisappear:animated];
+	[[NSNotificationCenter defaultCenter] removeObserver:self name:RV64RunnerVirtioFSDebugNotification object:nil];
+}
+
+- (void)dealloc
+{
+	[[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)reloadAll
+{
+	NSArray<NSString *> *lines = [RV64Runner virtioFSDebugLines];
+	self.textView.text = [lines componentsJoinedByString:@""];
+	[self scrollToBottom];
+}
+
+- (void)scrollToBottom
+{
+	UITextView *tv = self.textView;
+	if (!tv || tv.text.length == 0) {
+		return;
+	}
+	NSRange range = NSMakeRange(tv.text.length - 1, 1);
+	[tv scrollRangeToVisible:range];
+}
+
+- (void)appendLine:(NSString *)s
+{
+	if (s.length == 0) {
+		return;
+	}
+	UITextView *tv = self.textView;
+	if (!tv) {
+		return;
+	}
+	BOOL atBottom = (tv.contentOffset.y + tv.bounds.size.height + 40.0) >= tv.contentSize.height;
+	NSString *cur = tv.text ?: @"";
+	tv.text = [cur stringByAppendingString:s];
+	if (atBottom) {
+		[self scrollToBottom];
+	}
+}
+
+- (void)onDebugLine:(NSNotification *)note
+{
+	NSString *text = note.object;
+	if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+		return;
+	}
+	[self appendLine:text];
+}
+
+- (void)clearPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner clearVirtioFSDebug];
+	self.textView.text = @"";
+}
+
+@end
+
 @implementation RV64SettingsViewController
 
 - (instancetype)init
@@ -201,6 +309,8 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	self.ramMB = (mb > 0) ? mb : 1024;
 
 	self.disableIso = [d boolForKey:kRVVMDefaultsDisableIso];
+	id vfsDbgObj = [d objectForKey:kRVVMDefaultsVirtioFSDebugToUART];
+	self.virtioFSDebugToUart = vfsDbgObj ? [d boolForKey:kRVVMDefaultsVirtioFSDebugToUART] : YES;
 	self.isoFilename = [d stringForKey:kRVVMDefaultsIsoFilename];
 	self.diskFilename = [d stringForKey:kRVVMDefaultsDiskFilename];
 	NSArray *pf = [d objectForKey:kRVVMDefaultsPortForwards];
@@ -224,6 +334,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[d setInteger:self.cores forKey:kRVVMDefaultsCores];
 	[d setInteger:self.ramMB forKey:kRVVMDefaultsRamMB];
 	[d setBool:self.disableIso forKey:kRVVMDefaultsDisableIso];
+	[d setBool:self.virtioFSDebugToUart forKey:kRVVMDefaultsVirtioFSDebugToUART];
 	if (self.isoFilename.length > 0) {
 		[d setObject:self.isoFilename forKey:kRVVMDefaultsIsoFilename];
 	} else {
@@ -311,16 +422,17 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
 	(void)tableView;
-	return 3;
+	return 4;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
 	(void)tableView;
 	switch (section) {
-		case 0: return 8;
+		case 0: return 9;
 		case 1: return 2;
-		case 2: return self.docFiles.count;
+		case 2: return self.docFiles.count + 2;
+		case 3: return 2;
 	}
 	return 0;
 }
@@ -332,6 +444,14 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[self.tableView reloadData];
 }
 
+- (void)virtioFSDebugToUartChanged:(UISwitch *)sw
+{
+	self.virtioFSDebugToUart = sw.isOn;
+	[self saveDefaults];
+	[RV64Runner setVirtioFSDebugToUARTEnabled:self.virtioFSDebugToUart];
+	[self.tableView reloadData];
+}
+
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
 	(void)tableView;
@@ -339,6 +459,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		case 0: return @"Boot";
 		case 1: return @"Hardware";
 		case 2: return @"Documents";
+		case 3: return @"Debug";
 	}
 	return nil;
 }
@@ -388,19 +509,26 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 		} else if (indexPath.row == 5) {
+			cell.textLabel.text = @"Reinit network";
+			cell.textLabel.textColor = UIColor.labelColor;
+			cell.detailTextLabel.text = @"";
+			cell.accessoryType = UITableViewCellAccessoryNone;
+			cell.accessoryView = nil;
+			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+		} else if (indexPath.row == 6) {
 			cell.textLabel.text = @"Restart emulation";
 			cell.textLabel.textColor = UIColor.systemRedColor;
 			cell.detailTextLabel.text = @"";
 			cell.accessoryType = UITableViewCellAccessoryNone;
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-		} else if (indexPath.row == 6) {
+		} else if (indexPath.row == 7) {
 			cell.textLabel.text = @"Save snapshot";
 			cell.detailTextLabel.text = @"";
 			cell.accessoryType = UITableViewCellAccessoryNone;
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-		} else if (indexPath.row == 7) {
+		} else if (indexPath.row == 8) {
 			BOOL exists = [self snapshotExists];
 			cell.textLabel.text = @"Load snapshot";
 			cell.detailTextLabel.text = exists ? @"Available" : @"Missing";
@@ -427,18 +555,49 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return cell;
 	}
 
+	if (indexPath.section == 3) {
+		if (indexPath.row == 0) {
+			cell.textLabel.text = @"Virtio-FS debug in UART";
+			cell.detailTextLabel.text = @"";
+			UISwitch *sw = [UISwitch new];
+			sw.on = self.virtioFSDebugToUart;
+			[sw addTarget:self action:@selector(virtioFSDebugToUartChanged:) forControlEvents:UIControlEventValueChanged];
+			cell.accessoryType = UITableViewCellAccessoryNone;
+			cell.accessoryView = sw;
+			cell.selectionStyle = UITableViewCellSelectionStyleNone;
+			return cell;
+		}
+		cell.textLabel.text = @"Virtio-FS debug log";
+		cell.detailTextLabel.text = @"View";
+		cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+		cell.accessoryView = nil;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+		return cell;
+	}
+
 	cell.accessoryType = UITableViewCellAccessoryNone;
 	cell.accessoryView = nil;
-	cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-	cell.textLabel.text = self.docFiles[indexPath.row];
 	cell.detailTextLabel.text = @"";
+	if (indexPath.row == 0) {
+		cell.textLabel.text = @"Export documents";
+		cell.textLabel.textColor = UIColor.labelColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	} else if (indexPath.row == 1) {
+		cell.textLabel.text = @"Delete all documents";
+		cell.textLabel.textColor = UIColor.systemRedColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	} else {
+		cell.textLabel.text = self.docFiles[indexPath.row - 2];
+		cell.textLabel.textColor = UIColor.labelColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	}
 	return cell;
 }
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath
 {
 	(void)tableView;
-	if (indexPath.section == 2) {
+	if (indexPath.section == 2 && indexPath.row >= 2) {
 		return UITableViewCellEditingStyleDelete;
 	}
 	return UITableViewCellEditingStyleNone;
@@ -446,14 +605,14 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath
 {
-	if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 2) {
+	if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 2 || indexPath.row < 2) {
 		return;
 	}
 	NSString *docs = [self documentsDirPath];
 	if (docs.length == 0) {
 		return;
 	}
-	NSString *name = self.docFiles[indexPath.row];
+	NSString *name = self.docFiles[indexPath.row - 2];
 	NSString *path = [docs stringByAppendingPathComponent:name];
 	NSError *err = nil;
 	[[NSFileManager defaultManager] removeItemAtPath:path error:&err];
@@ -466,6 +625,90 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[self saveDefaults];
 	[self reloadDocFiles];
 	[tableView reloadData];
+}
+
+- (NSArray<NSURL *> *)documentsFileURLsForExport
+{
+	NSString *docs = [self documentsDirPath];
+	if (docs.length == 0) {
+		return @[];
+	}
+	NSError *err = nil;
+	NSArray<NSString *> *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:&err];
+	if (![names isKindOfClass:[NSArray class]] || names.count == 0) {
+		return @[];
+	}
+	NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+	for (NSString *name in names) {
+		if (name.length == 0 || [name hasPrefix:@"."]) {
+			continue;
+		}
+		NSString *path = [docs stringByAppendingPathComponent:name];
+		[urls addObject:[NSURL fileURLWithPath:path]];
+	}
+	return urls;
+}
+
+- (void)exportDocumentsFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSArray<NSURL *> *urls = [self documentsFileURLsForExport];
+	if (urls.count == 0) {
+		[self presentSimpleAlertWithTitle:@"Export documents" message:@"No files in Documents"];
+		return;
+	}
+
+	UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:urls applicationActivities:nil];
+	UIPopoverPresentationController *ppc = avc.popoverPresentationController;
+	if (ppc) {
+		ppc.sourceView = sourceView ?: self.view;
+		ppc.sourceRect = sourceView ? sourceRect : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+		ppc.permittedArrowDirections = UIPopoverArrowDirectionAny;
+	}
+	[self presentViewController:avc animated:YES completion:nil];
+}
+
+- (void)deleteAllDocumentsFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSString *docs = [self documentsDirPath];
+	if (docs.length == 0) {
+		[self presentSimpleAlertWithTitle:@"Delete documents" message:@"Documents directory not available"];
+		return;
+	}
+
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Delete documents"
+	                                                            message:@"Delete all files in Documents? This includes disks and snapshots."
+	                                                     preferredStyle:UIAlertControllerStyleActionSheet];
+	__weak typeof(self) weakSelf = self;
+	[ac addAction:[UIAlertAction actionWithTitle:@"Delete all" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+		__strong typeof(weakSelf) selfStrong = weakSelf;
+		if (!selfStrong) {
+			return;
+		}
+		NSError *err = nil;
+		NSArray<NSString *> *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:&err];
+		if ([names isKindOfClass:[NSArray class]]) {
+			for (NSString *name in names) {
+				if (name.length == 0 || [name hasPrefix:@"."]) {
+					continue;
+				}
+				NSString *path = [docs stringByAppendingPathComponent:name];
+				(void)[[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+			}
+		}
+		selfStrong.isoFilename = nil;
+		selfStrong.diskFilename = nil;
+		[selfStrong saveDefaults];
+		[selfStrong reloadDocFiles];
+		[selfStrong.tableView reloadData];
+	}]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	UIPopoverPresentationController *ppc = ac.popoverPresentationController;
+	if (ppc) {
+		ppc.sourceView = sourceView ?: self.view;
+		ppc.sourceRect = sourceView ? sourceRect : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+		ppc.permittedArrowDirections = UIPopoverArrowDirectionAny;
+	}
+	[self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)presentChoiceWithTitle:(NSString *)title options:(NSArray<NSString *> *)options fromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect handler:(void (^)(NSInteger idx))handler
@@ -633,6 +876,36 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return;
 	}
 	if (indexPath.section == 0 && indexPath.row == 5) {
+		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Reinit network"
+		                                                            message:@"This drops active connections and reinitializes the host networking backend."
+		                                                     preferredStyle:UIAlertControllerStyleAlert];
+		[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+		__weak typeof(self) weakSelf = self;
+		[ac addAction:[UIAlertAction actionWithTitle:@"Reinit" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+			__strong typeof(weakSelf) selfStrong = weakSelf;
+			if (!selfStrong) {
+				return;
+			}
+			UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"Network" message:@"Reinitializing…" preferredStyle:UIAlertControllerStyleAlert];
+			[selfStrong presentViewController:progress animated:YES completion:nil];
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+				NSString *err = nil;
+				BOOL ok = [RV64Runner reinitNetwork:&err];
+				dispatch_async(dispatch_get_main_queue(), ^{
+					[progress dismissViewControllerAnimated:YES completion:^{
+						NSString *title = ok ? @"Network reinitialized" : @"Network failed";
+						NSString *msg = ok ? @"OK" : (err ?: @"Unknown error");
+						UIAlertController *done = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+						[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+						[selfStrong presentViewController:done animated:YES completion:nil];
+					}];
+				});
+			});
+		}]];
+		[self presentViewController:ac animated:YES completion:nil];
+		return;
+	}
+	if (indexPath.section == 0 && indexPath.row == 6) {
 		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Restart emulation"
 		                                                            message:@"Restart RVVM with current settings?"
 		                                                     preferredStyle:UIAlertControllerStyleAlert];
@@ -647,7 +920,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		[self presentViewController:ac animated:YES completion:nil];
 		return;
 	}
-	if (indexPath.section == 0 && indexPath.row == 6) {
+	if (indexPath.section == 0 && indexPath.row == 7) {
 		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Save snapshot"
 		                                                            message:@"This saves the current VM state (RAM + CPU registers) to Documents/rvvm.snapshot.img"
 		                                                     preferredStyle:UIAlertControllerStyleAlert];
@@ -678,7 +951,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		[self presentViewController:ac animated:YES completion:nil];
 		return;
 	}
-	if (indexPath.section == 0 && indexPath.row == 7) {
+	if (indexPath.section == 0 && indexPath.row == 8) {
 		if (![self snapshotExists]) {
 			return;
 		}
@@ -737,6 +1010,19 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			[self saveDefaults];
 			[self.tableView reloadData];
 		}];
+		return;
+	}
+	if (indexPath.section == 3 && indexPath.row == 1) {
+		RV64VirtioFSDebugViewController *vc = [RV64VirtioFSDebugViewController new];
+		[self.navigationController pushViewController:vc animated:YES];
+		return;
+	}
+	if (indexPath.section == 2 && indexPath.row == 0) {
+		[self exportDocumentsFromSourceView:sourceView sourceRect:sourceRect];
+		return;
+	}
+	if (indexPath.section == 2 && indexPath.row == 1) {
+		[self deleteAllDocumentsFromSourceView:sourceView sourceRect:sourceRect];
 		return;
 	}
 }
