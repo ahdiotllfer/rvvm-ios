@@ -3,3 +3,7 @@
 @interface RV64RootViewController : UIViewController
 
 @end
+
+@interface RV64FramebufferViewController : UIViewController
+
+@end

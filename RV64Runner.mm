@@ -5,10 +5,15 @@
 #import <dispatch/dispatch.h>
 
 #include <rvvm/rvvm.h>
+#include <rvvm/rvvm_fb.h>
 
 extern "C" {
+#include "devices/bochs-display.h"
 #include "devices/chardev.h"
 #include "devices/eth-oc.h"
+#include "devices/framebuffer.h"
+#include "devices/hid_api.h"
+#include "devices/i2c-oc.h"
 #include "devices/nvme.h"
 #include "devices/ns16550a.h"
 #include "devices/pci-bus.h"
@@ -36,6 +41,19 @@ extern "C" {
 NSString *const RV64RunnerUARTTextNotification = @"RV64RunnerUARTTextNotification";
 NSString *const RV64RunnerUARTTextKey = @"text";
 NSString *const RV64RunnerVirtioFSDebugNotification = @"RV64RunnerVirtioFSDebugNotification";
+NSString *const RV64RunnerFramebufferNotification = @"RV64RunnerFramebufferNotification";
+NSString *const RV64RunnerFramebufferDataKey = @"data";
+NSString *const RV64RunnerFramebufferWidthKey = @"width";
+NSString *const RV64RunnerFramebufferHeightKey = @"height";
+NSString *const RV64RunnerFramebufferStrideKey = @"stride";
+NSString *const RV64RunnerFramebufferFormatKey = @"format";
+
+static std::atomic<uint32_t> s_fb_seq(0);
+static std::atomic<uint32_t> s_fb_width(0);
+static std::atomic<uint32_t> s_fb_height(0);
+static std::atomic<uint32_t> s_fb_stride(0);
+static std::atomic<uint32_t> s_fb_format(0);
+static std::atomic<uint32_t> s_fb_offset(0);
 
 static NSString *const kRVVMDefaultsBootMode = @"rvvm.bootMode";
 static NSString *const kRVVMDefaultsCores = @"rvvm.cores";
@@ -46,6 +64,7 @@ static NSString *const kRVVMDefaultsDiskFilename = @"rvvm.diskFilename";
 static NSString *const kRVVMDefaultsArchImgFilename = @"rvvm.archImgFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
 static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
+static NSString *const kRVVMDefaultsAutoLoadSnapshot = @"rvvm.autoLoadSnapshot";
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -121,6 +140,38 @@ extern "C" void rvvm_ios_virtiofs_debug_print(const char* s)
 	}
 }
 
+static void IOSFBDraw(rvvm_fbdev_t* fbdev)
+{
+	if (!fbdev) {
+		return;
+	}
+
+	rvvm_fb_t fb = {};
+	if (!rvvm_fbdev_get_scanout(fbdev, &fb) || !fb.buffer || fb.width == 0 || fb.height == 0 || fb.stride == 0) {
+		return;
+	}
+	size_t vramSize = 0;
+	uint8_t* vram = (uint8_t *)rvvm_fbdev_get_vram(fbdev, &vramSize);
+	if (!vram || vramSize == 0) {
+		return;
+	}
+	uintptr_t off = (uintptr_t)fb.buffer - (uintptr_t)vram;
+	if (off >= vramSize || off > UINT32_MAX) {
+		return;
+	}
+
+	s_fb_width.store(fb.width, std::memory_order_relaxed);
+	s_fb_height.store(fb.height, std::memory_order_relaxed);
+	s_fb_stride.store(fb.stride, std::memory_order_relaxed);
+	s_fb_format.store((uint32_t)fb.format, std::memory_order_relaxed);
+	s_fb_offset.store((uint32_t)off, std::memory_order_relaxed);
+	(void)s_fb_seq.fetch_add(1, std::memory_order_relaxed);
+}
+
+static const rvvm_display_cb_t s_ios_display_cb = {
+	.draw = IOSFBDraw,
+};
+
 static std::string FileSystemPath(NSURL *url)
 {
 	if (!url) {
@@ -151,6 +202,12 @@ static dispatch_source_t s_uart_flush_timer;
 static dispatch_once_t s_uart_flush_once;
 static rvvm_machine_t* s_machine = nullptr;
 static chardev_t* s_chardev = nullptr;
+static hid_keyboard_t* s_uart_keyboard_virtio = nullptr;
+static hid_mouse_t* s_mouse_virtio = nullptr;
+static std::atomic<uint32_t> s_mouse_abs_width(0);
+static std::atomic<uint32_t> s_mouse_abs_height(0);
+static rvvm_fbdev_t* s_fbdev = nullptr;
+static std::vector<uint8_t> s_fb_vram;
 static dispatch_semaphore_t s_restart_sema;
 static dispatch_once_t s_restart_once;
 static std::atomic<bool> s_restart_requested(false);
@@ -216,6 +273,109 @@ struct UIKitChardevState
 	std::string tx_buf;
 	CFAbsoluteTime lastPost = 0;
 };
+
+static bool MapAsciiToHidKey(uint8_t c, hid_key_t* keyOut, bool* shiftOut, bool* ctrlOut)
+{
+	if (!keyOut || !shiftOut || !ctrlOut) {
+		return false;
+	}
+	*shiftOut = false;
+	*ctrlOut = false;
+
+	if (c >= 1 && c <= 26) {
+		*ctrlOut = true;
+		*keyOut = (hid_key_t)(HID_KEY_A + (c - 1));
+		return true;
+	}
+
+	if (c >= 'a' && c <= 'z') {
+		*keyOut = (hid_key_t)(HID_KEY_A + (c - 'a'));
+		return true;
+	}
+
+	if (c >= 'A' && c <= 'Z') {
+		*keyOut = (hid_key_t)(HID_KEY_A + (c - 'A'));
+		*shiftOut = true;
+		return true;
+	}
+
+	if (c >= '1' && c <= '9') {
+		*keyOut = (hid_key_t)(HID_KEY_1 + (c - '1'));
+		return true;
+	}
+	if (c == '0') {
+		*keyOut = HID_KEY_0;
+		return true;
+	}
+
+	switch (c) {
+		case '\n': *keyOut = HID_KEY_ENTER; return true;
+		case '\t': *keyOut = HID_KEY_TAB; return true;
+		case 0x08: *keyOut = HID_KEY_BACKSPACE; return true;
+		case 0x7f: *keyOut = HID_KEY_BACKSPACE; return true;
+		case ' ':  *keyOut = HID_KEY_SPACE; return true;
+		case '-':  *keyOut = HID_KEY_MINUS; return true;
+		case '_':  *keyOut = HID_KEY_MINUS; *shiftOut = true; return true;
+		case '=':  *keyOut = HID_KEY_EQUAL; return true;
+		case '+':  *keyOut = HID_KEY_EQUAL; *shiftOut = true; return true;
+		case '[':  *keyOut = HID_KEY_LEFTBRACE; return true;
+		case '{':  *keyOut = HID_KEY_LEFTBRACE; *shiftOut = true; return true;
+		case ']':  *keyOut = HID_KEY_RIGHTBRACE; return true;
+		case '}':  *keyOut = HID_KEY_RIGHTBRACE; *shiftOut = true; return true;
+		case '\\': *keyOut = HID_KEY_BACKSLASH; return true;
+		case '|':  *keyOut = HID_KEY_BACKSLASH; *shiftOut = true; return true;
+		case ';':  *keyOut = HID_KEY_SEMICOLON; return true;
+		case ':':  *keyOut = HID_KEY_SEMICOLON; *shiftOut = true; return true;
+		case '\'': *keyOut = HID_KEY_APOSTROPHE; return true;
+		case '"':  *keyOut = HID_KEY_APOSTROPHE; *shiftOut = true; return true;
+		case '`':  *keyOut = HID_KEY_GRAVE; return true;
+		case '~':  *keyOut = HID_KEY_GRAVE; *shiftOut = true; return true;
+		case ',':  *keyOut = HID_KEY_COMMA; return true;
+		case '<':  *keyOut = HID_KEY_COMMA; *shiftOut = true; return true;
+		case '.':  *keyOut = HID_KEY_DOT; return true;
+		case '>':  *keyOut = HID_KEY_DOT; *shiftOut = true; return true;
+		case '/':  *keyOut = HID_KEY_SLASH; return true;
+		case '?':  *keyOut = HID_KEY_SLASH; *shiftOut = true; return true;
+		case '!':  *keyOut = HID_KEY_1; *shiftOut = true; return true;
+		case '@':  *keyOut = HID_KEY_2; *shiftOut = true; return true;
+		case '#':  *keyOut = HID_KEY_3; *shiftOut = true; return true;
+		case '$':  *keyOut = HID_KEY_4; *shiftOut = true; return true;
+		case '%':  *keyOut = HID_KEY_5; *shiftOut = true; return true;
+		case '^':  *keyOut = HID_KEY_6; *shiftOut = true; return true;
+		case '&':  *keyOut = HID_KEY_7; *shiftOut = true; return true;
+		case '*':  *keyOut = HID_KEY_8; *shiftOut = true; return true;
+		case '(':  *keyOut = HID_KEY_9; *shiftOut = true; return true;
+		case ')':  *keyOut = HID_KEY_0; *shiftOut = true; return true;
+		default:   return false;
+	}
+}
+
+static void InjectHidKeyVirtio(hid_keyboard_t* kb, hid_key_t key, bool shift, bool ctrl, bool alt)
+{
+	if (!kb) {
+		return;
+	}
+	if (ctrl) {
+		hid_keyboard_press_virtio(kb, HID_KEY_LEFTCTRL);
+	}
+	if (shift) {
+		hid_keyboard_press_virtio(kb, HID_KEY_LEFTSHIFT);
+	}
+	if (alt) {
+		hid_keyboard_press_virtio(kb, HID_KEY_LEFTALT);
+	}
+	hid_keyboard_press_virtio(kb, key);
+	hid_keyboard_release_virtio(kb, key);
+	if (alt) {
+		hid_keyboard_release_virtio(kb, HID_KEY_LEFTALT);
+	}
+	if (shift) {
+		hid_keyboard_release_virtio(kb, HID_KEY_LEFTSHIFT);
+	}
+	if (ctrl) {
+		hid_keyboard_release_virtio(kb, HID_KEY_LEFTCTRL);
+	}
+}
 
 static void EnsureUARTFlushTimerStarted()
 {
@@ -498,6 +658,8 @@ static bool RunLinuxOnce()
 		NSArray *portForwards = (NSArray *)[defaults objectForKey:kRVVMDefaultsPortForwards];
 		id vfsDbgObj = [defaults objectForKey:kRVVMDefaultsVirtioFSDebugToUART];
 		BOOL virtioFSDebugToUart = vfsDbgObj ? [defaults boolForKey:kRVVMDefaultsVirtioFSDebugToUART] : YES;
+		id autoSnapObj = [defaults objectForKey:kRVVMDefaultsAutoLoadSnapshot];
+		BOOL autoLoadSnapshot = autoSnapObj ? [defaults boolForKey:kRVVMDefaultsAutoLoadSnapshot] : YES;
 		s_vfs_debug_to_uart.store(virtioFSDebugToUart);
 
 		NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -541,10 +703,8 @@ static bool RunLinuxOnce()
 
 		std::string snapPath = SnapshotFilePathUTF8();
 		RvvmSnapshotHeader snapHdr = {};
-		bool haveSnap = (!snapPath.empty() && ReadRvvmSnapshotHeader(snapPath, &snapHdr));
-		if (!haveSnap && !snapPath.empty() && PathExists(snapPath)) {
-			PostUARTText("rvvm: snapshot present but incompatible, ignoring\n");
-		}
+		bool haveSnapHeader = (!snapPath.empty() && ReadRvvmSnapshotHeader(snapPath, &snapHdr));
+		bool haveSnap = haveSnapHeader && autoLoadSnapshot;
 
 		std::string isoPath;
 		if (!disableIso) {
@@ -643,7 +803,6 @@ static bool RunLinuxOnce()
 						return false;
 					}
 					NSError *err = nil;
-					PostUARTText("rvvm: copying disk image...\n");
 					if (![[NSFileManager defaultManager] copyItemAtPath:srcPathStr toPath:dstPath error:&err]) {
 						PostUARTText("rvvm: disk image copy failed\n");
 						return false;
@@ -676,7 +835,6 @@ static bool RunLinuxOnce()
 					NSString *seedPathStr = cfSeedPath ? (__bridge_transfer NSString *)cfSeedPath : nil;
 					if (seedPathStr) {
 						NSError *err = nil;
-						PostUARTText("rvvm: copying install disk seed...\n");
 						if (![[NSFileManager defaultManager] copyItemAtPath:seedPathStr toPath:installDiskPathStr error:&err]) {
 							PostUARTText("rvvm: install disk seed copy failed\n");
 						}
@@ -701,9 +859,6 @@ static bool RunLinuxOnce()
 					PostUARTText("rvvm: install disk create failed\n");
 					return false;
 				}
-				char buf[128];
-				snprintf(buf, sizeof(buf), "rvvm: install disk %zu MiB\n", (size_t)(diskSize >> 20));
-				PostUARTText(std::string(buf));
 			} else {
 				if (![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
 					PostUARTText("rvvm: snapshot load requires existing install disk\n");
@@ -711,8 +866,6 @@ static bool RunLinuxOnce()
 				}
 			}
 		}
-
-		PostUARTText("rvvm: starting...\n");
 
 		size_t preferredMem = 0;
 		if (haveSnap) {
@@ -765,12 +918,8 @@ static bool RunLinuxOnce()
 			PostUARTText("rvvm: rvvm_create_machine failed (RAM allocation)\n");
 			return false;
 		}
-		if (chosenMem != 0 && chosenMem != preferredMem) {
-			char buf[128];
-			snprintf(buf, sizeof(buf), "rvvm: RAM fallback to %zu MiB\n", (size_t)(chosenMem >> 20));
-			PostUARTText(std::string(buf));
-		}
 		rvvm_set_opt(machine, RVVM_OPT_JIT, 0);
+		rvvm_append_cmdline(machine, " console=ttyS0,115200 console=tty0 earlycon=sbi");
 
 		chardev_t* chardev = CreateUIKitChardev();
 		if (!chardev) {
@@ -782,6 +931,8 @@ static bool RunLinuxOnce()
 		riscv_clint_init_auto(machine);
 		riscv_plic_init_auto(machine);
 		tap_dev_t* tap = nullptr;
+		hid_keyboard_t* kbVirtio = hid_keyboard_init_auto_virtio(machine);
+		hid_mouse_t* mouseVirtio = hid_mouse_init_auto_virtio(machine);
 		pci_bus_t* pci = pci_bus_init_auto(machine);
 		if (!pci) {
 			PostUARTText("rvvm: pci bus failed\n");
@@ -789,13 +940,39 @@ static bool RunLinuxOnce()
 			rvvm_free_machine(machine);
 			return false;
 		}
-		PostUARTText("rvvm: pci bus ok\n");
+
+		rvvm_fbdev_t* fbdev = rvvm_fbdev_init();
+		if (!fbdev) {
+			PostUARTText("rvvm: fbdev init failed\n");
+			chardev_free(chardev);
+			rvvm_free_machine(machine);
+			return false;
+		}
+		rvvm_fbdev_inc_ref(fbdev);
+		std::vector<uint8_t> vram;
+		vram.resize((size_t)RVVM_BOCHS_DISPLAY_VRAM);
+		memset(vram.data(), 0, vram.size());
+		(void)rvvm_fbdev_set_vram(fbdev, vram.data(), vram.size());
+		{
+			rvvm_fb_t bootFb = {};
+			bootFb.width = 1280;
+			bootFb.height = 720;
+			bootFb.stride = bootFb.width * 4;
+			bootFb.format = RVVM_RGB_XRGB8888;
+			bootFb.buffer = vram.data();
+			rvvm_fbdev_set_scanout(fbdev, &bootFb);
+		}
+		rvvm_fbdev_register_display(fbdev, &s_ios_display_cb);
+		(void)rvvm_simplefb_init_auto(machine, fbdev);
+		(void)rvvm_bochs_display_init(pci, fbdev);
+		(void)i2c_oc_init_auto(machine);
 
 		tap = tap_open();
 		if (!tap) {
 			PostUARTText("rvvm: tap open failed\n");
 			chardev_free(chardev);
 			rvvm_free_machine(machine);
+			(void)rvvm_fbdev_dec_ref(fbdev);
 			return false;
 		}
 		if (!rtl8169_init(pci, tap)) {
@@ -803,9 +980,9 @@ static bool RunLinuxOnce()
 			tap_close(tap);
 			chardev_free(chardev);
 			rvvm_free_machine(machine);
+			(void)rvvm_fbdev_dec_ref(fbdev);
 			return false;
 		}
-		PostUARTText("rvvm: rtl8169 ok\n");
 
 		if (portForwards) {
 			for (NSUInteger i = 0; i < portForwards.count; i++) {
@@ -817,21 +994,18 @@ static bool RunLinuxOnce()
 				if (fwd.empty()) {
 					continue;
 				}
-				if (!tap_portfwd(tap, fwd.c_str())) {
-					PostUARTText("rvvm: port forward failed\n");
-				}
+				(void)tap_portfwd(tap, fwd.c_str());
 			}
 		}
 		if (useArchImage) {
-			if (nvme_init_auto(machine, imagePath.c_str(), true)) {
-				PostUARTText("rvvm: nvme ok\n");
-			} else {
+			if (!nvme_init_auto(machine, imagePath.c_str(), true)) {
 				PostUARTText("rvvm: nvme failed\n");
 				if (tap) {
 					tap_close(tap);
 				}
 				chardev_free(chardev);
 				rvvm_free_machine(machine);
+				(void)rvvm_fbdev_dec_ref(fbdev);
 				return false;
 			}
 		}
@@ -843,6 +1017,7 @@ static bool RunLinuxOnce()
 				}
 				chardev_free(chardev);
 				rvvm_free_machine(machine);
+				(void)rvvm_fbdev_dec_ref(fbdev);
 				return false;
 			}
 			if (!nvme_init_auto(machine, installDiskPath.c_str(), true)) {
@@ -852,19 +1027,15 @@ static bool RunLinuxOnce()
 				}
 				chardev_free(chardev);
 				rvvm_free_machine(machine);
+				(void)rvvm_fbdev_dec_ref(fbdev);
 				return false;
 			}
-			PostUARTText("rvvm: nvme iso+disk ok\n");
 		}
 		syscon_init_auto(machine);
 		rtc_goldfish_init_auto(machine);
 		ns16550a_init_auto(machine, chardev);
 		if (!docsPathUTF8.empty()) {
-			if (virtio_fs_init_auto(machine, "share", docsPathUTF8.c_str())) {
-				PostUARTText("rvvm: virtio-fs ok\n");
-			} else {
-				PostUARTText("rvvm: virtio-fs failed\n");
-			}
+			(void)virtio_fs_init_auto(machine, "share", docsPathUTF8.c_str());
 		}
 
 		if (!rvvm_load_firmware(machine, biosPath.c_str())) {
@@ -874,6 +1045,7 @@ static bool RunLinuxOnce()
 			}
 			chardev_free(chardev);
 			rvvm_free_machine(machine);
+			(void)rvvm_fbdev_dec_ref(fbdev);
 			return false;
 		}
 
@@ -884,19 +1056,10 @@ static bool RunLinuxOnce()
 #else
 				const uint32_t expectedFlags = 0x0;
 #endif
-				if ((snapHdr.flags & 0x1) != expectedFlags) {
-					PostUARTText("rvvm: snapshot flags mismatch, continuing boot\n");
-				} else if (snapHdr.mem_size != (uint64_t)chosenMem) {
-					PostUARTText("rvvm: snapshot RAM mismatch, continuing boot\n");
-				} else if (snapHdr.hart_count != (uint32_t)smp) {
-					PostUARTText("rvvm: snapshot core count mismatch, continuing boot\n");
-				} else {
-					PostUARTText("rvvm: snapshot found, loading...\n");
-					if (rvvm_load_snapshot(machine, snapPath.c_str())) {
-						PostUARTText("rvvm: snapshot loaded\n");
-					} else {
-						PostUARTText("rvvm: snapshot load failed, continuing boot\n");
-					}
+				if ((snapHdr.flags & 0x1) == expectedFlags &&
+				    snapHdr.mem_size == (uint64_t)chosenMem &&
+				    snapHdr.hart_count == (uint32_t)smp) {
+					(void)rvvm_load_snapshot(machine, snapPath.c_str());
 				}
 			}
 		}
@@ -905,6 +1068,16 @@ static bool RunLinuxOnce()
 			std::lock_guard<std::mutex> lock(s_state_mutex);
 			s_machine = machine;
 			s_chardev = chardev;
+			s_uart_keyboard_virtio = kbVirtio;
+			s_mouse_virtio = mouseVirtio;
+			s_fbdev = fbdev;
+			s_fb_vram.swap(vram);
+			s_fb_seq.store(0, std::memory_order_relaxed);
+			s_fb_width.store(0, std::memory_order_relaxed);
+			s_fb_height.store(0, std::memory_order_relaxed);
+			s_fb_stride.store(0, std::memory_order_relaxed);
+			s_fb_format.store(0, std::memory_order_relaxed);
+			s_fb_offset.store(0, std::memory_order_relaxed);
 			s_active_writable_disk_path = useIso ? installDiskPath : (useArchImage ? imagePath : std::string());
 		}
 		rvvm_start_machine(machine);
@@ -971,6 +1144,11 @@ static bool RunLinuxOnce()
 			std::lock_guard<std::mutex> lock(s_state_mutex);
 			s_chardev = nullptr;
 			s_machine = nullptr;
+			s_uart_keyboard_virtio = nullptr;
+			s_mouse_virtio = nullptr;
+			s_mouse_abs_width.store(0, std::memory_order_relaxed);
+			s_mouse_abs_height.store(0, std::memory_order_relaxed);
+			s_fbdev = nullptr;
 			s_active_writable_disk_path.clear();
 		}
 		if (tap) {
@@ -978,6 +1156,13 @@ static bool RunLinuxOnce()
 		}
 		chardev_free(chardev);
 		rvvm_free_machine(machine);
+		(void)rvvm_fbdev_dec_ref(fbdev);
+		fbdev = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(s_state_mutex);
+			s_fb_vram.clear();
+			s_fb_vram.shrink_to_fit();
+		}
 		return true;
 	}
 }
@@ -1005,10 +1190,38 @@ static bool RunLinuxOnce()
 	});
 }
 
++ (uint32_t)framebufferSeq
+{
+	return s_fb_seq.load(std::memory_order_relaxed);
+}
+
++ (void)framebufferMetaWidth:(uint32_t * _Nullable)widthOut
+                      height:(uint32_t * _Nullable)heightOut
+                      stride:(uint32_t * _Nullable)strideOut
+                      format:(uint32_t * _Nullable)formatOut
+                      offset:(uint32_t * _Nullable)offsetOut
+{
+	if (widthOut) {
+		*widthOut = s_fb_width.load(std::memory_order_relaxed);
+	}
+	if (heightOut) {
+		*heightOut = s_fb_height.load(std::memory_order_relaxed);
+	}
+	if (strideOut) {
+		*strideOut = s_fb_stride.load(std::memory_order_relaxed);
+	}
+	if (formatOut) {
+		*formatOut = s_fb_format.load(std::memory_order_relaxed);
+	}
+	if (offsetOut) {
+		*offsetOut = s_fb_offset.load(std::memory_order_relaxed);
+	}
+}
 + (void)setVirtioFSDebugToUARTEnabled:(BOOL)enabled
 {
 	s_vfs_debug_to_uart.store(enabled);
 }
+
 
 + (NSArray<NSString *> *)virtioFSDebugLines
 {
@@ -1279,6 +1492,207 @@ static bool RunLinuxOnce()
 		state->rx.push_back((uint8_t)'\n');
 	}
 	chardev_notify(s_chardev, UIKitChardevPoll(s_chardev));
+}
+
++ (BOOL)copyFramebufferBGRA:(NSMutableData *)outData
+                    width:(NSUInteger * _Nullable)widthOut
+                   height:(NSUInteger * _Nullable)heightOut
+              bytesPerRow:(NSUInteger * _Nullable)bytesPerRowOut
+{
+	if (!outData) {
+		return NO;
+	}
+
+	rvvm_fbdev_t* fbdev = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		fbdev = s_fbdev;
+		if (fbdev) {
+			rvvm_fbdev_inc_ref(fbdev);
+		}
+	}
+	if (!fbdev) {
+		return NO;
+	}
+
+	rvvm_fb_t fb = {};
+	if (!rvvm_fbdev_get_scanout(fbdev, &fb) || !fb.buffer || fb.width == 0 || fb.height == 0 || fb.stride == 0) {
+		(void)rvvm_fbdev_dec_ref(fbdev);
+		return NO;
+	}
+	if (fb.format != RVVM_RGB_XRGB8888) {
+		(void)rvvm_fbdev_dec_ref(fbdev);
+		return NO;
+	}
+
+	const size_t total = (size_t)fb.stride * (size_t)fb.height;
+	[outData setLength:total];
+	uint8_t* dst = (uint8_t *)outData.mutableBytes;
+	const uint8_t* src = (const uint8_t *)fb.buffer;
+	memcpy(dst, src, total);
+
+	if (widthOut) {
+		*widthOut = (NSUInteger)fb.width;
+	}
+	if (heightOut) {
+		*heightOut = (NSUInteger)fb.height;
+	}
+	if (bytesPerRowOut) {
+		*bytesPerRowOut = (NSUInteger)fb.stride;
+	}
+	(void)rvvm_fbdev_dec_ref(fbdev);
+	return YES;
+}
+
++ (void)sendVirtioText:(NSString *)text
+{
+	if (!text || text.length == 0) {
+		return;
+	}
+	std::string bytes = UTF8FromNSString(text);
+	if (bytes.empty()) {
+		return;
+	}
+	hid_keyboard_t* kb = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		kb = s_uart_keyboard_virtio;
+	}
+	if (!kb) {
+		return;
+	}
+	for (uint8_t c : bytes) {
+		hid_key_t key = HID_KEY_NONE;
+		bool shift = false;
+		bool ctrl = false;
+		if (!MapAsciiToHidKey(c, &key, &shift, &ctrl)) {
+			continue;
+		}
+		InjectHidKeyVirtio(kb, key, shift, ctrl, false);
+	}
+}
+
++ (void)sendVirtioText:(NSString *)text ctrl:(BOOL)ctrl alt:(BOOL)alt
+{
+	if (!text || text.length == 0) {
+		return;
+	}
+	std::string bytes = UTF8FromNSString(text);
+	if (bytes.empty()) {
+		return;
+	}
+	hid_keyboard_t* kb = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		kb = s_uart_keyboard_virtio;
+	}
+	if (!kb) {
+		return;
+	}
+	for (uint8_t c : bytes) {
+		hid_key_t key = HID_KEY_NONE;
+		bool shift = false;
+		bool ctrlFromAscii = false;
+		if (!MapAsciiToHidKey(c, &key, &shift, &ctrlFromAscii)) {
+			continue;
+		}
+		InjectHidKeyVirtio(kb, key, shift, ctrlFromAscii || ctrl, alt);
+	}
+}
+
++ (void)sendVirtioKey:(uint8_t)hidKey
+               shift:(BOOL)shift
+                ctrl:(BOOL)ctrl
+                 alt:(BOOL)alt
+{
+	hid_keyboard_t* kb = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		kb = s_uart_keyboard_virtio;
+	}
+	if (!kb || hidKey == 0) {
+		return;
+	}
+
+	InjectHidKeyVirtio(kb, (hid_key_t)hidKey, shift, ctrl, alt);
+}
+
++ (void)sendVirtioMouseDeltaX:(int32_t)dx deltaY:(int32_t)dy
+{
+	hid_mouse_t* mouse = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		mouse = s_mouse_virtio;
+	}
+	if (!mouse) {
+		return;
+	}
+	hid_mouse_move_virtio(mouse, dx, dy);
+}
+
++ (void)setVirtioMouseResolutionWidth:(uint32_t)width height:(uint32_t)height
+{
+	if (width == 0 || height == 0) {
+		return;
+	}
+	if (s_mouse_abs_width.load(std::memory_order_relaxed) == width &&
+	    s_mouse_abs_height.load(std::memory_order_relaxed) == height) {
+		return;
+	}
+	hid_mouse_t* mouse = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		mouse = s_mouse_virtio;
+	}
+	if (!mouse) {
+		return;
+	}
+	hid_mouse_resolution_virtio(mouse, width, height);
+	s_mouse_abs_width.store(width, std::memory_order_relaxed);
+	s_mouse_abs_height.store(height, std::memory_order_relaxed);
+}
+
++ (void)sendVirtioMouseAbsX:(int32_t)x absY:(int32_t)y
+{
+	hid_mouse_t* mouse = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		mouse = s_mouse_virtio;
+	}
+	if (!mouse) {
+		return;
+	}
+	hid_mouse_place_virtio(mouse, x, y);
+}
+
++ (void)sendVirtioMouseButtons:(uint8_t)btnMask down:(BOOL)down
+{
+	hid_mouse_t* mouse = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		mouse = s_mouse_virtio;
+	}
+	if (!mouse || btnMask == 0) {
+		return;
+	}
+	if (down) {
+		hid_mouse_press_virtio(mouse, (hid_btns_t)btnMask);
+	} else {
+		hid_mouse_release_virtio(mouse, (hid_btns_t)btnMask);
+	}
+}
+
++ (void)sendVirtioMouseScroll:(int32_t)offset
+{
+	hid_mouse_t* mouse = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		mouse = s_mouse_virtio;
+	}
+	if (!mouse) {
+		return;
+	}
+	hid_mouse_scroll_virtio(mouse, offset);
 }
 
 @end

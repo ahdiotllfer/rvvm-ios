@@ -15,13 +15,23 @@ rvvm_FILES = \
 	$(filter-out $(RVVM_DIR)/src/main.c,$(wildcard $(RVVM_DIR)/src/*.c)) \
 	$(wildcard $(RVVM_DIR)/src/cpu/*.c) \
 	$(RVVM_DIR)/src/devices/chardev_term.c \
+	$(RVVM_DIR)/src/devices/bochs-display.c \
+	$(RVVM_DIR)/src/devices/framebuffer.c \
 	$(RVVM_DIR)/src/devices/pci-bus.c \
 	$(RVVM_DIR)/src/devices/riscv-aclint.c \
 	$(RVVM_DIR)/src/devices/riscv-plic.c \
+	$(RVVM_DIR)/src/devices/i2c-oc.c \
+	$(RVVM_DIR)/src/devices/i2c-hid.c \
+	$(RVVM_DIR)/src/devices/hid-keyboard.c \
+	$(RVVM_DIR)/src/devices/hid-mouse.c \
 	$(RVVM_DIR)/src/devices/ns16550a.c \
+	$(RVVM_DIR)/src/devices/ps2-altera.c \
+	$(RVVM_DIR)/src/devices/ps2-keyboard.c \
+	$(RVVM_DIR)/src/devices/ps2-mouse.c \
 	$(RVVM_DIR)/src/devices/syscon.c \
 	$(RVVM_DIR)/src/devices/rtc-goldfish.c \
 	$(RVVM_DIR)/src/devices/virtio-fs.c \
+	$(RVVM_DIR)/src/devices/virtio-input.c \
 	$(RVVM_DIR)/src/devices/tap_user.c \
 	$(RVVM_DIR)/src/devices/rtl8169.c \
 	$(RVVM_DIR)/src/devices/nvme.c \
