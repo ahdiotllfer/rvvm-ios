@@ -2,6 +2,7 @@
 #import "RV64Runner.h"
 
 #import <dispatch/dispatch.h>
+#import <QuartzCore/QuartzCore.h>
 #import <WebKit/WebKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -12,6 +13,8 @@ static NSString *const kRVVMDefaultsDisableIso = @"rvvm.disableIso";
 static NSString *const kRVVMDefaultsIsoFilename = @"rvvm.isoFilename";
 static NSString *const kRVVMDefaultsDiskFilename = @"rvvm.diskFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
+static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
+static NSString *const kRVVMDefaultsAutoLoadSnapshot = @"rvvm.autoLoadSnapshot";
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -21,6 +24,466 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 };
 
 @interface RV64SettingsViewController : UITableViewController
+@end
+
+@protocol RV64TextInputSink <NSObject>
+- (void)rvvmInsertText:(NSString *)text;
+- (void)rvvmDeleteBackward;
+@end
+
+@interface RV64AccessoryTextView : UITextView
+@property (nonatomic, weak) id<RV64TextInputSink> rvvmSink;
+@property (nonatomic, strong) UIView *rvvmAccessoryView;
+@end
+
+@implementation RV64AccessoryTextView
+
+- (UIView *)inputAccessoryView
+{
+	return self.rvvmAccessoryView;
+}
+
+- (BOOL)hasText
+{
+	return YES;
+}
+
+- (void)insertText:(NSString *)text
+{
+	[self.rvvmSink rvvmInsertText:text];
+}
+
+- (void)deleteBackward
+{
+	[self.rvvmSink rvvmDeleteBackward];
+}
+
+@end
+
+@interface RV64FramebufferViewController () <RV64TextInputSink>
+@property (nonatomic, strong) UIImageView *imageView;
+@property (nonatomic, strong) CADisplayLink *displayLink;
+@property (nonatomic, strong) NSMutableData *fbData;
+@property (nonatomic) NSUInteger fbWidth;
+@property (nonatomic) NSUInteger fbHeight;
+@property (nonatomic) NSUInteger fbBytesPerRow;
+@property (nonatomic, strong) UILabel *debugLabel;
+@property (nonatomic) uint32_t lastFbSeq;
+@property (nonatomic) CFTimeInterval lastFbSeqChange;
+@property (nonatomic, strong) RV64AccessoryTextView *inputViewHidden;
+@property (nonatomic) uint8_t mouseButtons;
+@property (nonatomic) CGPoint mouseRemainder;
+@property (nonatomic) BOOL ctrlArmed;
+@property (nonatomic) BOOL altArmed;
+@property (nonatomic, strong) UIButton *ctrlButton;
+@property (nonatomic, strong) UIButton *altButton;
+@property (nonatomic, strong) UIButton *keyboardButton;
+@end
+
+@implementation RV64FramebufferViewController
+
+- (UIButton *)keyButtonWithTitle:(NSString *)title action:(SEL)action
+{
+	UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+	[b setTitle:title forState:UIControlStateNormal];
+	b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+	b.contentEdgeInsets = UIEdgeInsetsMake(6, 10, 6, 10);
+	b.layer.cornerRadius = 8;
+	b.layer.masksToBounds = YES;
+	[b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+	return b;
+}
+
+- (void)updateModifierButtons
+{
+	UIColor *activeBg = [UIColor.systemBlueColor colorWithAlphaComponent:0.20];
+	UIColor *inactiveBg = [UIColor.systemGray5Color colorWithAlphaComponent:0.80];
+	self.ctrlButton.selected = self.ctrlArmed;
+	self.altButton.selected = self.altArmed;
+	self.ctrlButton.backgroundColor = self.ctrlButton.selected ? activeBg : inactiveBg;
+	self.altButton.backgroundColor = self.altButton.selected ? activeBg : inactiveBg;
+}
+
+- (UIView *)buildVirtioKeyboardAccessoryView
+{
+	UIView *root = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 44)];
+
+	UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
+	blur.translatesAutoresizingMaskIntoConstraints = NO;
+	[root addSubview:blur];
+	[NSLayoutConstraint activateConstraints:@[
+		[blur.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+		[blur.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+		[blur.topAnchor constraintEqualToAnchor:root.topAnchor],
+		[blur.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+	]];
+
+	UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+	scroll.translatesAutoresizingMaskIntoConstraints = NO;
+	scroll.showsHorizontalScrollIndicator = NO;
+	scroll.alwaysBounceHorizontal = YES;
+	[blur.contentView addSubview:scroll];
+	[NSLayoutConstraint activateConstraints:@[
+		[scroll.leadingAnchor constraintEqualToAnchor:blur.contentView.leadingAnchor],
+		[scroll.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor],
+		[scroll.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
+		[scroll.bottomAnchor constraintEqualToAnchor:blur.contentView.bottomAnchor],
+	]];
+
+	UIStackView *stack = [[UIStackView alloc] initWithFrame:CGRectZero];
+	stack.translatesAutoresizingMaskIntoConstraints = NO;
+	stack.axis = UILayoutConstraintAxisHorizontal;
+	stack.spacing = 8;
+	stack.alignment = UIStackViewAlignmentCenter;
+	stack.layoutMarginsRelativeArrangement = YES;
+	stack.layoutMargins = UIEdgeInsetsMake(6, 8, 6, 8);
+	[scroll addSubview:stack];
+	[NSLayoutConstraint activateConstraints:@[
+		[stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
+		[stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
+		[stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
+		[stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
+		[stack.heightAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.heightAnchor],
+	]];
+
+	UIButton *esc = [self keyButtonWithTitle:@"Esc" action:@selector(keyEscPressed:)];
+	UIButton *uart = [self keyButtonWithTitle:@"UART" action:@selector(switchToUARTPressed:)];
+	UIButton *fb = [self keyButtonWithTitle:@"FB" action:@selector(switchToFramebufferPressed:)];
+	UIButton *settings = [self keyButtonWithTitle:@"Settings" action:@selector(keySettingsPressed:)];
+	UIButton *tab = [self keyButtonWithTitle:@"Tab" action:@selector(keyTabPressed:)];
+	UIButton *ctrl = [self keyButtonWithTitle:@"Ctrl" action:@selector(keyCtrlPressed:)];
+	UIButton *alt = [self keyButtonWithTitle:@"Alt" action:@selector(keyAltPressed:)];
+	self.ctrlButton = ctrl;
+	self.altButton = alt;
+
+	UIButton *up = [self keyButtonWithTitle:@"↑" action:@selector(keyUpPressed:)];
+	UIButton *down = [self keyButtonWithTitle:@"↓" action:@selector(keyDownPressed:)];
+	UIButton *left = [self keyButtonWithTitle:@"←" action:@selector(keyLeftPressed:)];
+	UIButton *right = [self keyButtonWithTitle:@"→" action:@selector(keyRightPressed:)];
+
+	UIButton *hide = [self keyButtonWithTitle:@"Hide" action:@selector(keyHidePressed:)];
+
+	NSArray<UIButton *> *all = @[esc, uart, fb, settings, tab, ctrl, alt, left, up, down, right, hide];
+	for (UIButton *b in all) {
+		[stack addArrangedSubview:b];
+	}
+
+	[self updateModifierButtons];
+	return root;
+}
+
+- (void)switchToUARTPressed:(id)sender
+{
+	(void)sender;
+	if (self.tabBarController) {
+		self.tabBarController.selectedIndex = 0;
+	}
+}
+
+- (void)switchToFramebufferPressed:(id)sender
+{
+	(void)sender;
+	if (self.tabBarController) {
+		self.tabBarController.selectedIndex = 1;
+	}
+}
+
+- (void)keyEscPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner sendVirtioKey:0x29 shift:NO ctrl:self.ctrlArmed alt:self.altArmed];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keySettingsPressed:(id)sender
+{
+	(void)sender;
+	[self.view endEditing:YES];
+	[self.navigationController setNavigationBarHidden:NO animated:YES];
+	RV64SettingsViewController *vc = [[RV64SettingsViewController alloc] init];
+	[self.navigationController pushViewController:vc animated:YES];
+}
+
+- (void)keyTabPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner sendVirtioKey:0x2b shift:NO ctrl:self.ctrlArmed alt:self.altArmed];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyCtrlPressed:(id)sender
+{
+	(void)sender;
+	self.ctrlArmed = !self.ctrlArmed;
+	[self updateModifierButtons];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyAltPressed:(id)sender
+{
+	(void)sender;
+	self.altArmed = !self.altArmed;
+	[self updateModifierButtons];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyUpPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner sendVirtioKey:0x52 shift:NO ctrl:self.ctrlArmed alt:self.altArmed];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyDownPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner sendVirtioKey:0x51 shift:NO ctrl:self.ctrlArmed alt:self.altArmed];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyLeftPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner sendVirtioKey:0x50 shift:NO ctrl:self.ctrlArmed alt:self.altArmed];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyRightPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner sendVirtioKey:0x4f shift:NO ctrl:self.ctrlArmed alt:self.altArmed];
+	[self.inputViewHidden becomeFirstResponder];
+}
+
+- (void)keyHidePressed:(id)sender
+{
+	(void)sender;
+	[self.view endEditing:YES];
+}
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.view.backgroundColor = UIColor.blackColor;
+	self.view.multipleTouchEnabled = YES;
+
+	self.imageView = [[UIImageView alloc] initWithFrame:CGRectZero];
+	self.imageView.contentMode = UIViewContentModeScaleAspectFit;
+	self.imageView.translatesAutoresizingMaskIntoConstraints = NO;
+	[self.view addSubview:self.imageView];
+
+	UIButton *kb = [self keyButtonWithTitle:@"KB" action:@selector(keyKeyboardPressed:)];
+	kb.translatesAutoresizingMaskIntoConstraints = NO;
+	kb.backgroundColor = [UIColor.systemGray5Color colorWithAlphaComponent:0.80];
+	[self.view addSubview:kb];
+	self.keyboardButton = kb;
+
+	[NSLayoutConstraint activateConstraints:@[
+		[self.imageView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+		[self.imageView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+		[self.imageView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+		[self.imageView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+		[kb.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-8.0],
+		[kb.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8.0],
+	]];
+
+	self.fbData = [[NSMutableData alloc] init];
+	self.lastFbSeq = 0;
+	self.lastFbSeqChange = CACurrentMediaTime();
+
+	self.inputViewHidden = [[RV64AccessoryTextView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+	self.inputViewHidden.autocorrectionType = UITextAutocorrectionTypeNo;
+	self.inputViewHidden.autocapitalizationType = UITextAutocapitalizationTypeNone;
+	self.inputViewHidden.spellCheckingType = UITextSpellCheckingTypeNo;
+	self.inputViewHidden.keyboardType = UIKeyboardTypeDefault;
+	self.inputViewHidden.returnKeyType = UIReturnKeyDefault;
+	self.inputViewHidden.rvvmSink = self;
+	self.inputViewHidden.rvvmAccessoryView = [self buildVirtioKeyboardAccessoryView];
+	self.inputViewHidden.text = @"";
+	self.inputViewHidden.textColor = UIColor.clearColor;
+	self.inputViewHidden.backgroundColor = UIColor.clearColor;
+	self.inputViewHidden.translatesAutoresizingMaskIntoConstraints = YES;
+	self.inputViewHidden.alpha = 0.01;
+	self.inputViewHidden.userInteractionEnabled = NO;
+	self.inputViewHidden.frame = CGRectMake(-1000, -1000, 1, 1);
+	[self.view addSubview:self.inputViewHidden];
+
+	UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapPressed:)];
+	[self.view addGestureRecognizer:tap];
+
+	UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panMoved:)];
+	pan.minimumNumberOfTouches = 1;
+	pan.maximumNumberOfTouches = 1;
+	[self.view addGestureRecognizer:pan];
+
+	UIPanGestureRecognizer *scrollPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(scrollPanMoved:)];
+	scrollPan.minimumNumberOfTouches = 2;
+	scrollPan.maximumNumberOfTouches = 2;
+	[self.view addGestureRecognizer:scrollPan];
+
+	UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPressChanged:)];
+	longPress.minimumPressDuration = 0.25;
+	[self.view addGestureRecognizer:longPress];
+
+	[RV64Runner startLinux];
+}
+
+- (void)keyKeyboardPressed:(id)sender
+{
+	(void)sender;
+	if ([self.inputViewHidden isFirstResponder]) {
+		[self.inputViewHidden resignFirstResponder];
+	} else {
+		[self.inputViewHidden becomeFirstResponder];
+	}
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+	[super viewWillAppear:animated];
+	if (!self.displayLink) {
+		self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayTick:)];
+		[self.displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+	}
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+	[super viewWillDisappear:animated];
+	[self.displayLink invalidate];
+	self.displayLink = nil;
+
+	if (self.mouseButtons != 0) {
+		uint8_t btns = self.mouseButtons;
+		self.mouseButtons = 0;
+		[RV64Runner sendVirtioMouseButtons:btns down:NO];
+	}
+	[self.inputViewHidden resignFirstResponder];
+}
+
+- (void)tapPressed:(UITapGestureRecognizer *)gr
+{
+	(void)gr;
+	[RV64Runner sendVirtioMouseButtons:1 down:YES];
+	[RV64Runner sendVirtioMouseButtons:1 down:NO];
+}
+
+- (void)panMoved:(UIPanGestureRecognizer *)gr
+{
+	if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
+		UIView *v = gr.view ?: self.view;
+		CGPoint t = [gr translationInView:v];
+		CGPoint r = self.mouseRemainder;
+		double dxf = (double)t.x + (double)r.x;
+		double dyf = (double)t.y + (double)r.y;
+		int32_t dx = (int32_t)llround(dxf);
+		int32_t dy = (int32_t)llround(dyf);
+		if (dx != 0 || dy != 0) {
+			[RV64Runner sendVirtioMouseDeltaX:dx deltaY:dy];
+			r.x = (CGFloat)(dxf - (double)dx);
+			r.y = (CGFloat)(dyf - (double)dy);
+			self.mouseRemainder = r;
+			[gr setTranslation:CGPointZero inView:v];
+		}
+	}
+}
+
+- (void)scrollPanMoved:(UIPanGestureRecognizer *)gr
+{
+	if (gr.state != UIGestureRecognizerStateBegan && gr.state != UIGestureRecognizerStateChanged) {
+		return;
+	}
+	UIView *v = gr.view ?: self.view;
+	CGPoint t = [gr translationInView:v];
+	const CGFloat stepPx = 24.0;
+	int32_t steps = (int32_t)llround(t.y / stepPx);
+	if (steps == 0) {
+		return;
+	}
+	[RV64Runner sendVirtioMouseScroll:steps];
+	[gr setTranslation:CGPointZero inView:v];
+}
+
+- (void)longPressChanged:(UILongPressGestureRecognizer *)gr
+{
+	if (gr.state == UIGestureRecognizerStateBegan) {
+		self.mouseButtons |= 1;
+		[RV64Runner sendVirtioMouseButtons:1 down:YES];
+		return;
+	}
+	if (gr.state == UIGestureRecognizerStateEnded || gr.state == UIGestureRecognizerStateCancelled || gr.state == UIGestureRecognizerStateFailed) {
+		if (self.mouseButtons & 1) {
+			self.mouseButtons &= (uint8_t)~1;
+			[RV64Runner sendVirtioMouseButtons:1 down:NO];
+		}
+		return;
+	}
+}
+
+- (void)displayTick:(CADisplayLink *)dl
+{
+	(void)dl;
+	@autoreleasepool {
+		const CFTimeInterval now = CACurrentMediaTime();
+		const uint32_t seq = [RV64Runner framebufferSeq];
+		uint32_t metaW = 0;
+		uint32_t metaH = 0;
+		uint32_t metaStride = 0;
+		uint32_t metaFmt = 0;
+		uint32_t metaOff = 0;
+		[RV64Runner framebufferMetaWidth:&metaW height:&metaH stride:&metaStride format:&metaFmt offset:&metaOff];
+		if (seq != 0 && seq != self.lastFbSeq) {
+			self.lastFbSeq = seq;
+			self.lastFbSeqChange = now;
+		}
+
+		NSUInteger w = 0;
+		NSUInteger h = 0;
+		NSUInteger bpr = 0;
+		if (![RV64Runner copyFramebufferBGRA:self.fbData width:&w height:&h bytesPerRow:&bpr]) {
+			return;
+		}
+		if (w == 0 || h == 0 || bpr == 0) {
+			return;
+		}
+		self.fbWidth = w;
+		self.fbHeight = h;
+		self.fbBytesPerRow = bpr;
+
+		CGDataProviderRef provider = CGDataProviderCreateWithCFData((CFDataRef)self.fbData);
+		if (!provider) {
+			return;
+		}
+		CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+		CGBitmapInfo bi = kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst;
+		CGImageRef img = CGImageCreate((size_t)w, (size_t)h, 8, 32, (size_t)bpr, cs, bi, provider, NULL, false, kCGRenderingIntentDefault);
+		CGDataProviderRelease(provider);
+		CGColorSpaceRelease(cs);
+		if (!img) {
+			return;
+		}
+		UIImage *ui = [UIImage imageWithCGImage:img scale:UIScreen.mainScreen.scale orientation:UIImageOrientationUp];
+		CGImageRelease(img);
+		self.imageView.image = ui;
+	}
+}
+
+- (void)rvvmInsertText:(NSString *)text
+{
+	if (text.length > 0) {
+		[RV64Runner sendVirtioText:text ctrl:self.ctrlArmed alt:self.altArmed];
+	}
+}
+
+- (void)rvvmDeleteBackward
+{
+	[RV64Runner sendVirtioKey:0x2a shift:NO ctrl:NO alt:NO];
+}
+
+@end
+
+@interface RV64VirtioFSDebugViewController : UIViewController
 @end
 
 @interface RV64TerminalWebView : WKWebView
@@ -37,7 +500,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 @end
 
 @interface RV64RootViewController ()
-<WKScriptMessageHandler, WKNavigationDelegate>
+<WKScriptMessageHandler, WKNavigationDelegate, UIGestureRecognizerDelegate>
 @property (nonatomic, strong) RV64TerminalWebView *terminalView;
 @property (nonatomic) BOOL terminalReady;
 @property (nonatomic, strong) NSMutableArray<NSString *> *pendingWritesB64;
@@ -45,6 +508,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 @property (nonatomic) BOOL altArmed;
 @property (nonatomic, strong) UIButton *ctrlButton;
 @property (nonatomic, strong) UIButton *altButton;
+@property (nonatomic, strong) NSLayoutConstraint *terminalBottomConstraint;
 @end
 
 @interface RV64SettingsViewController () <UIDocumentPickerDelegate>
@@ -52,6 +516,8 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 @property (nonatomic) NSInteger cores;
 @property (nonatomic) NSInteger ramMB;
 @property (nonatomic) BOOL disableIso;
+@property (nonatomic) BOOL virtioFSDebugToUart;
+@property (nonatomic) BOOL autoLoadSnapshot;
 @property (nonatomic, copy) NSString *isoFilename;
 @property (nonatomic, copy) NSString *diskFilename;
 @property (nonatomic, copy) NSArray<NSString *> *portForwards;
@@ -166,6 +632,109 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 
 @end
 
+@interface RV64VirtioFSDebugViewController ()
+@property (nonatomic, strong) UITextView *textView;
+@end
+
+@implementation RV64VirtioFSDebugViewController
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.title = @"Virtio-FS Debug";
+	self.view.backgroundColor = UIColor.systemBackgroundColor;
+
+	UITextView *tv = [UITextView new];
+	tv.editable = NO;
+	tv.selectable = YES;
+	tv.alwaysBounceVertical = YES;
+	tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+	tv.textColor = UIColor.labelColor;
+	tv.backgroundColor = UIColor.systemBackgroundColor;
+	tv.translatesAutoresizingMaskIntoConstraints = NO;
+	[self.view addSubview:tv];
+	self.textView = tv;
+
+	[NSLayoutConstraint activateConstraints:@[
+		[tv.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:12],
+		[tv.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-12],
+		[tv.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
+		[tv.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-12],
+	]];
+
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Clear" style:UIBarButtonItemStylePlain target:self action:@selector(clearPressed:)];
+	[self reloadAll];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+	[super viewWillAppear:animated];
+	[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onDebugLine:) name:RV64RunnerVirtioFSDebugNotification object:nil];
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+	[super viewWillDisappear:animated];
+	[[NSNotificationCenter defaultCenter] removeObserver:self name:RV64RunnerVirtioFSDebugNotification object:nil];
+}
+
+- (void)dealloc
+{
+	[[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)reloadAll
+{
+	NSArray<NSString *> *lines = [RV64Runner virtioFSDebugLines];
+	self.textView.text = [lines componentsJoinedByString:@""];
+	[self scrollToBottom];
+}
+
+- (void)scrollToBottom
+{
+	UITextView *tv = self.textView;
+	if (!tv || tv.text.length == 0) {
+		return;
+	}
+	NSRange range = NSMakeRange(tv.text.length - 1, 1);
+	[tv scrollRangeToVisible:range];
+}
+
+- (void)appendLine:(NSString *)s
+{
+	if (s.length == 0) {
+		return;
+	}
+	UITextView *tv = self.textView;
+	if (!tv) {
+		return;
+	}
+	BOOL atBottom = (tv.contentOffset.y + tv.bounds.size.height + 40.0) >= tv.contentSize.height;
+	NSString *cur = tv.text ?: @"";
+	tv.text = [cur stringByAppendingString:s];
+	if (atBottom) {
+		[self scrollToBottom];
+	}
+}
+
+- (void)onDebugLine:(NSNotification *)note
+{
+	NSString *text = note.object;
+	if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+		return;
+	}
+	[self appendLine:text];
+}
+
+- (void)clearPressed:(id)sender
+{
+	(void)sender;
+	[RV64Runner clearVirtioFSDebug];
+	self.textView.text = @"";
+}
+
+@end
+
 @implementation RV64SettingsViewController
 
 - (instancetype)init
@@ -201,6 +770,10 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	self.ramMB = (mb > 0) ? mb : 1024;
 
 	self.disableIso = [d boolForKey:kRVVMDefaultsDisableIso];
+	id vfsDbgObj = [d objectForKey:kRVVMDefaultsVirtioFSDebugToUART];
+	self.virtioFSDebugToUart = vfsDbgObj ? [d boolForKey:kRVVMDefaultsVirtioFSDebugToUART] : YES;
+	id autoSnapObj = [d objectForKey:kRVVMDefaultsAutoLoadSnapshot];
+	self.autoLoadSnapshot = autoSnapObj ? [d boolForKey:kRVVMDefaultsAutoLoadSnapshot] : YES;
 	self.isoFilename = [d stringForKey:kRVVMDefaultsIsoFilename];
 	self.diskFilename = [d stringForKey:kRVVMDefaultsDiskFilename];
 	NSArray *pf = [d objectForKey:kRVVMDefaultsPortForwards];
@@ -224,6 +797,8 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[d setInteger:self.cores forKey:kRVVMDefaultsCores];
 	[d setInteger:self.ramMB forKey:kRVVMDefaultsRamMB];
 	[d setBool:self.disableIso forKey:kRVVMDefaultsDisableIso];
+	[d setBool:self.virtioFSDebugToUart forKey:kRVVMDefaultsVirtioFSDebugToUART];
+	[d setBool:self.autoLoadSnapshot forKey:kRVVMDefaultsAutoLoadSnapshot];
 	if (self.isoFilename.length > 0) {
 		[d setObject:self.isoFilename forKey:kRVVMDefaultsIsoFilename];
 	} else {
@@ -311,7 +886,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
 	(void)tableView;
-	return 3;
+	return 4;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
@@ -320,15 +895,31 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	switch (section) {
 		case 0: return 9;
 		case 1: return 2;
-		case 2: return self.docFiles.count;
+		case 2: return self.docFiles.count + 2;
+		case 3: return 3;
 	}
 	return 0;
+}
+
+- (void)autoLoadSnapshotChanged:(UISwitch *)sw
+{
+	self.autoLoadSnapshot = sw.isOn;
+	[self saveDefaults];
+	[self.tableView reloadData];
 }
 
 - (void)disableIsoChanged:(UISwitch *)sw
 {
 	self.disableIso = sw.isOn;
 	[self saveDefaults];
+	[self.tableView reloadData];
+}
+
+- (void)virtioFSDebugToUartChanged:(UISwitch *)sw
+{
+	self.virtioFSDebugToUart = sw.isOn;
+	[self saveDefaults];
+	[RV64Runner setVirtioFSDebugToUARTEnabled:self.virtioFSDebugToUart];
 	[self.tableView reloadData];
 }
 
@@ -339,6 +930,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		case 0: return @"Boot";
 		case 1: return @"Hardware";
 		case 2: return @"Documents";
+		case 3: return @"Debug";
 	}
 	return nil;
 }
@@ -388,15 +980,15 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 		} else if (indexPath.row == 5) {
-			cell.textLabel.text = @"Restart emulation";
-			cell.textLabel.textColor = UIColor.systemRedColor;
+			cell.textLabel.text = @"Reinit network";
+			cell.textLabel.textColor = UIColor.labelColor;
 			cell.detailTextLabel.text = @"";
 			cell.accessoryType = UITableViewCellAccessoryNone;
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 		} else if (indexPath.row == 6) {
-			cell.textLabel.text = @"Reinit network";
-			cell.textLabel.textColor = UIColor.systemOrangeColor;
+			cell.textLabel.text = @"Restart emulation";
+			cell.textLabel.textColor = UIColor.systemRedColor;
 			cell.detailTextLabel.text = @"";
 			cell.accessoryType = UITableViewCellAccessoryNone;
 			cell.accessoryView = nil;
@@ -434,18 +1026,60 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return cell;
 	}
 
+	if (indexPath.section == 3) {
+		if (indexPath.row == 0) {
+			cell.textLabel.text = @"Virtio-FS debug in UART";
+			cell.detailTextLabel.text = @"";
+			UISwitch *sw = [UISwitch new];
+			sw.on = self.virtioFSDebugToUart;
+			[sw addTarget:self action:@selector(virtioFSDebugToUartChanged:) forControlEvents:UIControlEventValueChanged];
+			cell.accessoryType = UITableViewCellAccessoryNone;
+			cell.accessoryView = sw;
+			cell.selectionStyle = UITableViewCellSelectionStyleNone;
+			return cell;
+		}
+		if (indexPath.row == 1) {
+			cell.textLabel.text = @"Auto-load snapshot on startup";
+			cell.detailTextLabel.text = @"";
+			UISwitch *sw = [UISwitch new];
+			sw.on = self.autoLoadSnapshot;
+			[sw addTarget:self action:@selector(autoLoadSnapshotChanged:) forControlEvents:UIControlEventValueChanged];
+			cell.accessoryType = UITableViewCellAccessoryNone;
+			cell.accessoryView = sw;
+			cell.selectionStyle = UITableViewCellSelectionStyleNone;
+			return cell;
+		}
+		cell.textLabel.text = @"Virtio-FS debug log";
+		cell.detailTextLabel.text = @"View";
+		cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+		cell.accessoryView = nil;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+		return cell;
+	}
+
 	cell.accessoryType = UITableViewCellAccessoryNone;
 	cell.accessoryView = nil;
-	cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-	cell.textLabel.text = self.docFiles[indexPath.row];
 	cell.detailTextLabel.text = @"";
+	if (indexPath.row == 0) {
+		cell.textLabel.text = @"Export documents";
+		cell.textLabel.textColor = UIColor.labelColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	} else if (indexPath.row == 1) {
+		cell.textLabel.text = @"Delete all documents";
+		cell.textLabel.textColor = UIColor.systemRedColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	} else {
+		cell.textLabel.text = self.docFiles[indexPath.row - 2];
+		cell.textLabel.textColor = UIColor.labelColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	}
 	return cell;
 }
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath
 {
 	(void)tableView;
-	if (indexPath.section == 2) {
+	if (indexPath.section == 2 && indexPath.row >= 2) {
 		return UITableViewCellEditingStyleDelete;
 	}
 	return UITableViewCellEditingStyleNone;
@@ -453,14 +1087,14 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath
 {
-	if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 2) {
+	if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 2 || indexPath.row < 2) {
 		return;
 	}
 	NSString *docs = [self documentsDirPath];
 	if (docs.length == 0) {
 		return;
 	}
-	NSString *name = self.docFiles[indexPath.row];
+	NSString *name = self.docFiles[indexPath.row - 2];
 	NSString *path = [docs stringByAppendingPathComponent:name];
 	NSError *err = nil;
 	[[NSFileManager defaultManager] removeItemAtPath:path error:&err];
@@ -473,6 +1107,90 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[self saveDefaults];
 	[self reloadDocFiles];
 	[tableView reloadData];
+}
+
+- (NSArray<NSURL *> *)documentsFileURLsForExport
+{
+	NSString *docs = [self documentsDirPath];
+	if (docs.length == 0) {
+		return @[];
+	}
+	NSError *err = nil;
+	NSArray<NSString *> *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:&err];
+	if (![names isKindOfClass:[NSArray class]] || names.count == 0) {
+		return @[];
+	}
+	NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+	for (NSString *name in names) {
+		if (name.length == 0 || [name hasPrefix:@"."]) {
+			continue;
+		}
+		NSString *path = [docs stringByAppendingPathComponent:name];
+		[urls addObject:[NSURL fileURLWithPath:path]];
+	}
+	return urls;
+}
+
+- (void)exportDocumentsFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSArray<NSURL *> *urls = [self documentsFileURLsForExport];
+	if (urls.count == 0) {
+		[self presentSimpleAlertWithTitle:@"Export documents" message:@"No files in Documents"];
+		return;
+	}
+
+	UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:urls applicationActivities:nil];
+	UIPopoverPresentationController *ppc = avc.popoverPresentationController;
+	if (ppc) {
+		ppc.sourceView = sourceView ?: self.view;
+		ppc.sourceRect = sourceView ? sourceRect : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+		ppc.permittedArrowDirections = UIPopoverArrowDirectionAny;
+	}
+	[self presentViewController:avc animated:YES completion:nil];
+}
+
+- (void)deleteAllDocumentsFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSString *docs = [self documentsDirPath];
+	if (docs.length == 0) {
+		[self presentSimpleAlertWithTitle:@"Delete documents" message:@"Documents directory not available"];
+		return;
+	}
+
+	UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Delete documents"
+	                                                            message:@"Delete all files in Documents? This includes disks and snapshots."
+	                                                     preferredStyle:UIAlertControllerStyleActionSheet];
+	__weak typeof(self) weakSelf = self;
+	[ac addAction:[UIAlertAction actionWithTitle:@"Delete all" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+		__strong typeof(weakSelf) selfStrong = weakSelf;
+		if (!selfStrong) {
+			return;
+		}
+		NSError *err = nil;
+		NSArray<NSString *> *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:&err];
+		if ([names isKindOfClass:[NSArray class]]) {
+			for (NSString *name in names) {
+				if (name.length == 0 || [name hasPrefix:@"."]) {
+					continue;
+				}
+				NSString *path = [docs stringByAppendingPathComponent:name];
+				(void)[[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+			}
+		}
+		selfStrong.isoFilename = nil;
+		selfStrong.diskFilename = nil;
+		[selfStrong saveDefaults];
+		[selfStrong reloadDocFiles];
+		[selfStrong.tableView reloadData];
+	}]];
+	[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	UIPopoverPresentationController *ppc = ac.popoverPresentationController;
+	if (ppc) {
+		ppc.sourceView = sourceView ?: self.view;
+		ppc.sourceRect = sourceView ? sourceRect : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+		ppc.permittedArrowDirections = UIPopoverArrowDirectionAny;
+	}
+	[self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)presentChoiceWithTitle:(NSString *)title options:(NSArray<NSString *> *)options fromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect handler:(void (^)(NSInteger idx))handler
@@ -640,6 +1358,36 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return;
 	}
 	if (indexPath.section == 0 && indexPath.row == 5) {
+		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Reinit network"
+		                                                            message:@"This drops active connections and reinitializes the host networking backend."
+		                                                     preferredStyle:UIAlertControllerStyleAlert];
+		[ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+		__weak typeof(self) weakSelf = self;
+		[ac addAction:[UIAlertAction actionWithTitle:@"Reinit" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+			__strong typeof(weakSelf) selfStrong = weakSelf;
+			if (!selfStrong) {
+				return;
+			}
+			UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"Network" message:@"Reinitializing…" preferredStyle:UIAlertControllerStyleAlert];
+			[selfStrong presentViewController:progress animated:YES completion:nil];
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+				NSString *err = nil;
+				BOOL ok = [RV64Runner reinitNetwork:&err];
+				dispatch_async(dispatch_get_main_queue(), ^{
+					[progress dismissViewControllerAnimated:YES completion:^{
+						NSString *title = ok ? @"Network reinitialized" : @"Network failed";
+						NSString *msg = ok ? @"OK" : (err ?: @"Unknown error");
+						UIAlertController *done = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+						[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+						[selfStrong presentViewController:done animated:YES completion:nil];
+					}];
+				});
+			});
+		}]];
+		[self presentViewController:ac animated:YES completion:nil];
+		return;
+	}
+	if (indexPath.section == 0 && indexPath.row == 6) {
 		UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Restart emulation"
 		                                                            message:@"Restart RVVM with current settings?"
 		                                                     preferredStyle:UIAlertControllerStyleAlert];
@@ -652,10 +1400,6 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			[selfStrong.navigationController popViewControllerAnimated:YES];
 		}]];
 		[self presentViewController:ac animated:YES completion:nil];
-		return;
-	}
-	if (indexPath.section == 0 && indexPath.row == 6) {
-		[RV64Runner reinitNetwork];
 		return;
 	}
 	if (indexPath.section == 0 && indexPath.row == 7) {
@@ -748,6 +1492,19 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			[self saveDefaults];
 			[self.tableView reloadData];
 		}];
+		return;
+	}
+	if (indexPath.section == 3 && indexPath.row == 2) {
+		RV64VirtioFSDebugViewController *vc = [RV64VirtioFSDebugViewController new];
+		[self.navigationController pushViewController:vc animated:YES];
+		return;
+	}
+	if (indexPath.section == 2 && indexPath.row == 0) {
+		[self exportDocumentsFromSourceView:sourceView sourceRect:sourceRect];
+		return;
+	}
+	if (indexPath.section == 2 && indexPath.row == 1) {
+		[self deleteAllDocumentsFromSourceView:sourceView sourceRect:sourceRect];
 		return;
 	}
 }
@@ -849,6 +1606,8 @@ static uint8_t CtrlifyByte(uint8_t c)
 	]];
 
 	UIButton *esc = [self keyButtonWithTitle:@"Esc" action:@selector(keyEscPressed:)];
+	UIButton *uart = [self keyButtonWithTitle:@"UART" action:@selector(switchToUARTPressed:)];
+	UIButton *fb = [self keyButtonWithTitle:@"FB" action:@selector(switchToFramebufferPressed:)];
 	UIButton *settings = [self keyButtonWithTitle:@"Settings" action:@selector(keySettingsPressed:)];
 	UIButton *tab = [self keyButtonWithTitle:@"Tab" action:@selector(keyTabPressed:)];
 	UIButton *ctrl = [self keyButtonWithTitle:@"Ctrl" action:@selector(keyCtrlPressed:)];
@@ -863,13 +1622,29 @@ static uint8_t CtrlifyByte(uint8_t c)
 
 	UIButton *hide = [self keyButtonWithTitle:@"Hide" action:@selector(keyHidePressed:)];
 
-	NSArray<UIButton *> *all = @[esc, settings, tab, ctrl, alt, left, up, down, right, hide];
+	NSArray<UIButton *> *all = @[esc, uart, fb, settings, tab, ctrl, alt, left, up, down, right, hide];
 	for (UIButton *b in all) {
 		[stack addArrangedSubview:b];
 	}
 
 	[self updateModifierButtons];
 	return root;
+}
+
+- (void)switchToUARTPressed:(id)sender
+{
+	(void)sender;
+	if (self.tabBarController) {
+		self.tabBarController.selectedIndex = 0;
+	}
+}
+
+- (void)switchToFramebufferPressed:(id)sender
+{
+	(void)sender;
+	if (self.tabBarController) {
+		self.tabBarController.selectedIndex = 1;
+	}
 }
 
 - (void)keyEscPressed:(id)sender
@@ -975,6 +1750,62 @@ static uint8_t CtrlifyByte(uint8_t c)
 	[self.navigationController setNavigationBarHidden:NO animated:animated];
 }
 
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer
+{
+	(void)gestureRecognizer;
+	(void)otherGestureRecognizer;
+	return YES;
+}
+
+- (void)tapPressed:(UITapGestureRecognizer *)gr
+{
+	(void)gr;
+	[self.terminalView evaluateJavaScript:@"window.rvvmFocus && window.rvvmFocus();" completionHandler:nil];
+}
+
+- (void)panMoved:(UIPanGestureRecognizer *)gr
+{
+	if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
+		UIView *v = gr.view ?: self.view;
+		CGPoint t = [gr translationInView:v];
+		const CGFloat stepPx = 24.0;
+		int32_t steps = (int32_t)llround(t.y / stepPx);
+		if (steps == 0) {
+			return;
+		}
+		int32_t lines = -steps;
+		NSString *js = [NSString stringWithFormat:@"window.rvvmScrollLines && window.rvvmScrollLines(%d);", lines];
+		[self.terminalView evaluateJavaScript:js completionHandler:nil];
+		[gr setTranslation:CGPointZero inView:v];
+	}
+}
+
+- (void)longPressChanged:(UILongPressGestureRecognizer *)gr
+{
+	(void)gr;
+}
+
+- (void)keyboardWillChangeFrame:(NSNotification *)note
+{
+	NSDictionary *ui = note.userInfo;
+	CGRect kbEnd = [ui[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+	CGRect kbEndInView = [self.view convertRect:kbEnd fromView:nil];
+	CGRect bounds = self.view.bounds;
+	CGRect inter = CGRectIntersection(bounds, kbEndInView);
+	CGFloat overlap = CGRectIsNull(inter) ? 0.0 : inter.size.height;
+
+	NSTimeInterval duration = [ui[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+	NSInteger curve = [ui[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+	UIViewAnimationOptions options = (UIViewAnimationOptions)(curve << 16);
+
+	self.terminalBottomConstraint.constant = -overlap;
+	[UIView animateWithDuration:duration delay:0 options:options animations:^{
+		[self.view layoutIfNeeded];
+	} completion:^(__unused BOOL finished) {
+		[self.terminalView evaluateJavaScript:@"window.rvvmFit && window.rvvmFit(); try{term && term.scrollToBottom && term.scrollToBottom();}catch(e){}" completionHandler:nil];
+	}];
+}
+
 - (void)viewDidLoad {
 	[super viewDidLoad];
 
@@ -992,6 +1823,10 @@ static uint8_t CtrlifyByte(uint8_t c)
 	web.opaque = NO;
 	web.backgroundColor = UIColor.clearColor;
 	web.scrollView.backgroundColor = UIColor.clearColor;
+	web.scrollView.scrollEnabled = YES;
+	web.scrollView.bounces = NO;
+	web.scrollView.alwaysBounceVertical = NO;
+	web.scrollView.alwaysBounceHorizontal = NO;
 	if ([web.scrollView respondsToSelector:@selector(setContentInsetAdjustmentBehavior:)]) {
 		web.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
 	}
@@ -1001,14 +1836,22 @@ static uint8_t CtrlifyByte(uint8_t c)
 	[self.view addSubview:web];
 	self.terminalView = web;
 
+	NSLayoutConstraint *bottom = [web.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:0];
+	self.terminalBottomConstraint = bottom;
 	[NSLayoutConstraint activateConstraints:@[
 		[web.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:0],
 		[web.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:0],
 		[web.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:0],
-		[web.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:0],
+		bottom,
 	]];
 
+	UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapPressed:)];
+	tap.cancelsTouchesInView = NO;
+	tap.delegate = self;
+	[self.view addGestureRecognizer:tap];
+
 	[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(rv64UartText:) name:RV64RunnerUARTTextNotification object:nil];
+	[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillChangeFrame:) name:UIKeyboardWillChangeFrameNotification object:nil];
 	[RV64Runner startLinux];
 
 	NSString *html =
@@ -1021,6 +1864,7 @@ static uint8_t CtrlifyByte(uint8_t c)
 	"#term{position:fixed;inset:0;width:100vw;height:100vh;background:var(--bg);}"
 	"#term .xterm{position:absolute;inset:0;width:100%;height:100%;}"
 	".xterm,.xterm-viewport,.xterm-screen{background:var(--bg)!important;}"
+	".xterm-viewport{overflow-y:scroll;-webkit-overflow-scrolling:touch;}"
 	"#fallback{position:absolute;left:12px;top:12px;right:12px;color:var(--fg);font-family:ui-monospace,Menlo,monospace;font-size:12px;white-space:pre-wrap;}"
 	"</style>"
 	"</head><body><div id='term'></div><div id='fallback'>Loading terminal…\nIf it stays black, xterm assets didn’t load.</div>"
@@ -1034,6 +1878,7 @@ static uint8_t CtrlifyByte(uint8_t c)
 	"function bytesFromB64(b64){let bin=atob(b64); let bytes=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++){bytes[i]=bin.charCodeAt(i);} return bytes;}"
 	"window.rvvmWriteBase64=function(b64){try{let bytes=bytesFromB64(b64); let txt=new TextDecoder('utf-8').decode(bytes); term && term.write(txt);}catch(e){}};"
 	"window.rvvmFocus=function(){try{term && term.focus();}catch(e){}};"
+	"window.rvvmScrollLines=function(n){try{term && term.scrollLines(Number(n)||0);}catch(e){}};"
 	"function refit(){try{fit && fit.fit();}catch(e){}}"
 	"function scheduleFit(){try{requestAnimationFrame(function(){refit(); requestAnimationFrame(refit);});}catch(e){refit();}}"
 	"window.rvvmFit=function(){scheduleFit();};"
@@ -1045,7 +1890,12 @@ static uint8_t CtrlifyByte(uint8_t c)
 	"term.open(document.getElementById('term')); scheduleFit(); term.focus();"
 	"let fb=document.getElementById('fallback'); if(fb) fb.style.display='none';"
 	"term.write('booting...\\r\\n');"
-	"term.onData(function(data){try{let bytes=new TextEncoder().encode(data); let b64=b64FromBytes(bytes); window.webkit.messageHandlers.rvvm.postMessage({t:'in', b64:b64});}catch(e){postLog('onData failed: '+e);}});"
+	"term.onData(function(data){try{"
+	"let bytes=new TextEncoder().encode(data);"
+	"let b64=b64FromBytes(bytes);"
+	"window.webkit.messageHandlers.rvvm.postMessage({t:'in', b64:b64});"
+	"if(data && (data.indexOf('\\r')>=0 || data.indexOf('\\n')>=0)){ term.scrollToBottom(); }"
+	"}catch(e){postLog('onData failed: '+e);}});"
 	"window.addEventListener('resize', scheduleFit);"
 	"try{window.visualViewport && window.visualViewport.addEventListener('resize', scheduleFit);}catch(e){}"
 	"try{if('ResizeObserver' in window){let ro=new ResizeObserver(scheduleFit); ro.observe(document.body); ro.observe(document.getElementById('term'));}}catch(e){}"
